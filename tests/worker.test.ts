@@ -66,6 +66,9 @@ test('/enqueue needs the bearer credential and a registered job', async () => {
   assert.equal(ok.status, 202);
   assert.equal(sent.length, 1);
   assert.match(sent[0].id, /^jobs-marts:manual:/);
+  for (const bad of [null, [], 'jobs-marts', 7]) {
+    assert.equal((await handleRequest(enqueue(bad), env)).status, 400, `rejects ${JSON.stringify(bad)}`);
+  }
   const off = makeEnv({ JOBS_TOKEN: undefined });
   assert.equal((await handleRequest(enqueue({ job: 'jobs-marts' }), off.env)).status, 503);
 });
@@ -80,6 +83,7 @@ test('consumer dispatches the GitHub workflow and acks on 204', async () => {
   assert.equal(calls[0].url, 'https://api.github.com/repos/bookchaowalit/data-lake-pipelines/actions/workflows/jobs-marts.yml/dispatches');
   assert.deepEqual(JSON.parse(calls[0].init.body as string), { ref: 'main' });
   assert.equal((calls[0].init.headers as Record<string, string>).authorization, `Bearer ${dispatchCredential}`);
+  assert.ok(calls[0].init.signal instanceof AbortSignal, 'dispatch is bounded by a timeout');
 });
 
 test('consumer retries with growing delay on failure, a missing credential, or a network error', async () => {

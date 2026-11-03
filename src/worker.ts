@@ -33,6 +33,7 @@ export interface MessageBatchLike<T> {
 }
 
 export const RETRY_DELAY_SECONDS = 60;
+export const TARGET_TIMEOUT_MS = 15_000;
 const MAX_BODY_BYTES = 4 * 1024;
 
 function json(body: unknown, status = 200): Response {
@@ -73,13 +74,15 @@ async function handleEnqueue(request: Request, env: Env): Promise<Response> {
   if (!timingSafeEqual(auth, `Bearer ${env.JOBS_TOKEN}`)) return reject(401, 'unauthorized');
   const raw = await request.text();
   if (raw.length > MAX_BODY_BYTES) return reject(413, 'payload_too_large');
-  let body: { job?: unknown };
+  let body: unknown;
   try {
-    body = JSON.parse(raw) as { job?: unknown };
+    body = JSON.parse(raw);
   } catch {
     return reject(400, 'invalid_payload');
   }
-  const job = typeof body.job === 'string' ? findJob(body.job) : undefined;
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return reject(400, 'invalid_payload');
+  const name = (body as { job?: unknown }).job;
+  const job = typeof name === 'string' ? findJob(name) : undefined;
   if (!job) return reject(404, 'unknown_job');
   const id = `${job.name}:manual:${crypto.randomUUID()}`;
   await env.JOBS_QUEUE.send(jobEnvelope(job, id, new Date(), 'enqueue-api'), { contentType: 'json' });
@@ -132,6 +135,7 @@ export async function runJob(job: JobDef, message: JobEnvelope, env: Env): Promi
         'content-type': 'application/json',
       },
       body: JSON.stringify({ ref: target.ref }),
+      signal: AbortSignal.timeout(TARGET_TIMEOUT_MS),
     });
     return res.status === 204;
   }
@@ -141,13 +145,15 @@ export async function runJob(job: JobDef, message: JobEnvelope, env: Env): Promi
     method: 'POST',
     headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', 'idempotency-key': message.id },
     body: JSON.stringify(message),
+    signal: AbortSignal.timeout(TARGET_TIMEOUT_MS),
   });
   return res.ok;
 }
 
 export async function handleQueue(batch: MessageBatchLike<JobEnvelope>, env: Env): Promise<void> {
   for (const message of batch.messages) {
-    const job = findJob(message.body?.data?.job ?? '');
+    const name = message.body?.data?.job;
+    const job = typeof name === 'string' ? findJob(name) : undefined;
     if (!job) {
       // Removed from the registry after it was queued: nothing to run.
       console.warn('jobs: unknown job dropped', message.id);
