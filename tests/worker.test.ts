@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { afterEach, test } from 'node:test';
+import { parseCron } from '../src/cron.js';
 import { JOBS } from '../src/jobs.js';
 import { handleQueue, handleRequest, handleScheduled, jobEnvelope, type Env, type JobEnvelope, type MessageLike } from '../src/worker.js';
 
@@ -41,21 +42,25 @@ function message(body: JobEnvelope, attempts = 1) {
 
 const marts = JOBS.find((j) => j.name === 'jobs-marts')!;
 
-test('every cron in the registry is a wrangler trigger and every trigger has a job', () => {
+test('the Worker has one every-minute trigger and every registry cron parses', () => {
   const toml = readFileSync(new URL('../wrangler.toml', import.meta.url), 'utf8');
-  const crons = JSON.parse(/crons = (\[.*\])/.exec(toml)![1]) as string[];
-  const registry = [...new Set(JOBS.map((j) => j.cron).filter(Boolean))];
-  assert.deepEqual([...crons].sort(), [...registry].sort());
+  assert.deepEqual(JSON.parse(/crons = (\[.*\])/.exec(toml)![1]), ['* * * * *']);
+  for (const job of JOBS) if (job.cron) assert.ok(parseCron(job.cron), `${job.name}: ${job.cron}`);
+  assert.equal(new Set(JOBS.map((j) => j.name)).size, JOBS.length, 'job names are unique');
 });
 
-test('a cron tick enqueues its jobs with a deterministic id per slot', async () => {
+test('a minute tick enqueues only the jobs due then, with a deterministic id per slot', async () => {
   const { env, sent } = makeEnv();
-  const slot = Date.UTC(2026, 10, 3, 14, 47);
-  assert.equal(await handleScheduled('47 */2 * * *', slot, env), 1);
+  const slot = Date.UTC(2026, 10, 3, 14, 47, 12); // seconds are dropped from the slot
+  assert.equal(await handleScheduled(slot, env), 1);
   assert.equal(sent[0].id, 'jobs-marts:2026-11-03T14:47:00.000Z');
   assert.equal(sent[0].type, 'job.jobs-marts.requested');
   assert.equal(sent[0].producer, 'jobs-cron');
-  assert.equal(await handleScheduled('0 0 * * *', slot, env), 0);
+  assert.equal(await handleScheduled(Date.UTC(2026, 10, 3, 14, 48), env), 0);
+  // Monday 2026-11-02 02:30 UTC: two weekly jobs share the slot.
+  sent.length = 0;
+  assert.equal(await handleScheduled(Date.UTC(2026, 10, 2, 2, 30), env), 2);
+  assert.deepEqual(sent.map((m) => m.data.job).sort(), ['data-lake-cloud-contract', 'mcp-catalog-refresh']);
 });
 
 test('/enqueue needs the bearer credential and a registered job', async () => {
@@ -81,7 +86,7 @@ test('consumer dispatches the GitHub workflow and acks on 204', async () => {
   await handleQueue({ queue: 'jobs', messages: [m] }, env);
   assert.equal(state.acked, true);
   assert.equal(calls[0].url, 'https://api.github.com/repos/bookchaowalit/data-lake-pipelines/actions/workflows/jobs-marts.yml/dispatches');
-  assert.deepEqual(JSON.parse(calls[0].init.body as string), { ref: 'main' });
+  assert.deepEqual(JSON.parse(calls[0].init.body as string), { ref: 'main', inputs: { source: 'jobs-queue' } });
   assert.equal((calls[0].init.headers as Record<string, string>).authorization, `Bearer ${dispatchCredential}`);
   assert.ok(calls[0].init.signal instanceof AbortSignal, 'dispatch is bounded by a timeout');
 });

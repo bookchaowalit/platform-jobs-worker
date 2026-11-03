@@ -16,18 +16,19 @@ POST /enqueue ───┴─► queue `jobs` ─► consumer (retry) ──┤
 
 | Route / handler | Behavior |
 |---|---|
-| `scheduled` | For each cron trigger, enqueues every job in `src/jobs.ts` with that cron. Message id = `<job>:<slot ISO time>`. |
+| `scheduled` | One every-minute trigger (Workers Free allows 5 cron triggers per account). Each minute, `src/cron.ts` matches every job's own UTC cron and enqueues the due jobs. Message id = `<job>:<slot ISO time>`. |
 | `POST /enqueue` | Bearer `JOBS_TOKEN`; body `{"job":"<name>"}`. Only jobs in the registry are accepted (`404 unknown_job`), so it can never call an arbitrary URL. `202 {"queued":true,"id":...}`. |
-| `queue` (`jobs`) | Runs the job target. `github_workflow`: `POST /repos/{repo}/actions/workflows/{wf}/dispatches`, ack on `204`. `http`: POST the envelope with a bearer and `idempotency-key`, ack on 2xx. Otherwise retry after 60 s × attempt; after 5 retries → `jobs-dlq`. |
+| `queue` (`jobs`) | Runs the job target. `github_workflow`: `POST /repos/{repo}/actions/workflows/{wf}/dispatches` with the job's `inputs`, ack on `204`. `http`: POST the envelope with a bearer and `idempotency-key`, ack on 2xx. Otherwise retry after 60 s × attempt; after 5 retries → `jobs-dlq`. |
 | `GET /healthz` | `200 {"ok":true,"dlq_backlog":0}`; `503` while `jobs-dlq` holds messages, which the uptime Worker (`jobs-worker` target) turns into a Telegram alert. |
 
 Message body = ADR-0008 envelope: `{id,type:"job.<name>.requested",version,occurred_at,producer,correlation_id,causation_id,data:{job}}`.
 
 ## Add a job
 
-1. Add a `JobDef` to `src/jobs.ts` (name, optional `cron`, target).
-2. If it has a new cron string, add it to `[triggers] crons` in `wrangler.toml`; a test fails when the two lists differ.
-3. A job that runs inline in an old scheduler: remove that schedule once the queued run has worked for 3 days (ADR-0008 M2).
+1. Add a `JobDef` to `src/jobs.ts` (name, optional UTC `cron`, target). No `wrangler.toml` change: the every-minute trigger covers every cron.
+2. Check the target first: a dispatch to a ref that does not exist must answer `422 No ref found` (token can dispatch; nothing runs). `Cannot trigger ... disabled workflow` = leave it out.
+3. Read the workflow for `github.event_name` checks: a dispatch is not a `schedule` event. Give it an input (as `jobs-marts` has `source: jobs-queue`) when the behavior differs.
+4. Replace the workflow's `schedule:` with a comment naming the job, in the same change.
 
 ## Local checks
 
@@ -39,16 +40,29 @@ npm run typecheck
 
 ## State (2026-11-03)
 
-Deployed (`33f6320b`) with the Infisical `/cloudflare` token: queues `jobs` and `jobs-dlq`, cron
-`47 */2 * * *`, secrets `JOBS_TOKEN` and `GITHUB_DISPATCH_TOKEN` (both in Infisical `/jobs`).
-Smoke: `/enqueue jobs-marts` → `202`, consumer dispatched `data-lake-pipelines` `jobs-marts.yml`
-(run 41669082329, `workflow_dispatch`); unknown job `404`, no bearer `401`; `/healthz` `200`
-with `dlq_backlog: 0`. Watched by the uptime Worker as `jobs-worker`.
+Deployed with the Infisical `/cloudflare` token: queues `jobs` and `jobs-dlq`, one cron trigger
+`* * * * *`, secrets `JOBS_TOKEN` and `GITHUB_DISPATCH_TOKEN` (both in Infisical `/jobs`).
+Watched by the uptime Worker as `jobs-worker`.
 
-First job `jobs-marts`: the workflow keeps its GitHub `schedule` until 2026-11-06 as a fallback
-(the workflow is idempotent, so a duplicate run writes nothing), then the schedule is removed.
+| Job | Cron (UTC) | Workflow | Moved |
+|---|---|---|---|
+| `jobs-marts` | `47 */2 * * *` | data-lake-pipelines `jobs-marts.yml` (input `source=jobs-queue`) | 2026-11-03 |
+| `career-job-capture` | `17 */6 * * *` | career-job-scraper `scheduled-capture.yml` | 2026-11-03 |
+| `org-hub-sync` | `0 2 * * *` | platform-ops-cli `org-hub-sync.yml` | 2026-11-03 |
+| `data-lake-cloud-contract` | `30 2 * * 1` | data-lake-pipelines | 2026-11-03 |
+| `free-cloud-e2e` | `17 3 * * 1` | data-lake-pipelines | 2026-11-03 |
+| `polyglot-bench` | `0 2 * * 1` | devtools-polyglot-benchmark `bench.yml` | 2026-11-03 |
+| `mcp-catalog-refresh` | `30 2 * * 1` | solo-empire | 2026-11-03 |
+
+Kept on the GitHub cron on purpose: life-dashboard-web `autopilot.yml` (a dispatch skips the
+`AUTOPILOT_ENABLED` gate and defaults to dry-run) and platform-ops-cli `ci-runner-failover.yml`
+(a dispatch defaults to dry-run; it is the CI runner fallback). a2n-api `source-watch.yml` is a
+disabled workflow.
+
+Smoke: `/enqueue jobs-marts` → `202` → run 41678398137 (`workflow_dispatch`, `source=jobs-queue`)
+completed `success`; unknown job `404`, no bearer `401`; `/healthz` `200` with `dlq_backlog: 0`.
 
 `GITHUB_DISPATCH_TOKEN` is the existing all-repo fine-grained token (`REGISTRY_EXPORT_GITHUB_TOKEN`).
 Owner item: replace it with a fine-grained token limited to **Actions: write** on the job repos.
 
-Rollback: `npx wrangler rollback`, or delete the cron trigger and restore the workflow schedule.
+Rollback: `npx wrangler rollback`, then restore the `schedule:` blocks named in the table.

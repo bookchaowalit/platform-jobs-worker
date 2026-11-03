@@ -7,9 +7,10 @@ workers_dev = true
 
 # The account comes from CLOUDFLARE_ACCOUNT_ID (Infisical /cloudflare).
 
-# One cron string per schedule in src/jobs.ts (a test checks they match).
+# One every-minute trigger; src/cron.ts matches each job's own schedule (Workers Free allows only
+# 5 cron triggers per account, and the uptime Worker uses 2).
 [triggers]
-crons = ["47 */2 * * *"]
+crons = ["* * * * *"]
 
 # ADR-0008 queue plane. Created once with:
 #   wrangler queues create jobs && wrangler queues create jobs-dlq

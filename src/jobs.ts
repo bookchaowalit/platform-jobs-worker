@@ -1,8 +1,11 @@
 // Job registry (ADR-0008 queue plane). Only jobs listed here can be enqueued, so /enqueue can
-// never be pointed at an arbitrary URL. `cron` uses the same string as wrangler.toml [triggers].
+// never be pointed at an arbitrary URL. `cron` is UTC, matched by src/cron.ts every minute.
+// A job moved here from a workflow `schedule` has that schedule removed from the workflow.
+
+import { cronMatches, parseCron } from './cron.js';
 
 export type JobTarget =
-  | { kind: 'github_workflow'; repo: string; workflow: string; ref: string }
+  | { kind: 'github_workflow'; repo: string; workflow: string; ref: string; inputs?: Record<string, string> }
   | { kind: 'http'; url: string; tokenSecret: 'GATEWAY_TOKEN' };
 
 export interface JobDef {
@@ -11,20 +14,35 @@ export interface JobDef {
   target: JobTarget;
 }
 
+const gh = (repo: string, workflow: string, inputs?: Record<string, string>): JobTarget => ({
+  kind: 'github_workflow',
+  repo: `bookchaowalit/${repo}`,
+  workflow,
+  ref: 'main',
+  ...(inputs ? { inputs } : {}),
+});
+
 export const JOBS: readonly JobDef[] = [
-  // Jobs Bronze → Silver → Gold. GitHub's own cron starts hours late; this tick is punctual and
-  // the workflow is idempotent, so a duplicate run from the old schedule writes nothing.
-  {
-    name: 'jobs-marts',
-    cron: '47 */2 * * *',
-    target: { kind: 'github_workflow', repo: 'bookchaowalit/data-lake-pipelines', workflow: 'jobs-marts.yml', ref: 'main' },
-  },
+  // Jobs Bronze → Silver → Gold; `source` makes the run behave like a scheduled one (no forced BI deploy).
+  { name: 'jobs-marts', cron: '47 */2 * * *', target: gh('data-lake-pipelines', 'jobs-marts.yml', { source: 'jobs-queue' }) },
+  // Track B job capture into Bronze (feeds jobs-marts 30 min later).
+  { name: 'career-job-capture', cron: '17 */6 * * *', target: gh('career-job-scraper', 'scheduled-capture.yml') },
+  { name: 'org-hub-sync', cron: '0 2 * * *', target: gh('platform-ops-cli', 'org-hub-sync.yml') },
+  { name: 'data-lake-cloud-contract', cron: '30 2 * * 1', target: gh('data-lake-pipelines', 'data-lake-cloud-contract.yml') },
+  { name: 'free-cloud-e2e', cron: '17 3 * * 1', target: gh('data-lake-pipelines', 'free-cloud-e2e.yml') },
+  { name: 'polyglot-bench', cron: '0 2 * * 1', target: gh('devtools-polyglot-benchmark', 'bench.yml') },
+  { name: 'mcp-catalog-refresh', cron: '30 2 * * 1', target: gh('solo-empire', 'mcp-catalog-refresh.yml') },
 ];
+
+const PARSED = new Map(JOBS.filter((job) => job.cron).map((job) => [job.name, parseCron(job.cron as string)]));
 
 export function findJob(name: string): JobDef | undefined {
   return JOBS.find((job) => job.name === name);
 }
 
-export function jobsForCron(cron: string): JobDef[] {
-  return JOBS.filter((job) => job.cron === cron);
+export function jobsDueAt(at: Date): JobDef[] {
+  return JOBS.filter((job) => {
+    const cron = PARSED.get(job.name);
+    return cron ? cronMatches(cron, at) : false;
+  });
 }

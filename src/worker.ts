@@ -3,7 +3,7 @@
 
 import * as Sentry from '@sentry/cloudflare';
 import { sentryOptions } from './sentry.js';
-import { findJob, jobsForCron, type JobDef } from './jobs.js';
+import { findJob, jobsDueAt, type JobDef } from './jobs.js';
 
 export interface QueueLike {
   send(body: unknown, options?: { contentType?: 'json' }): Promise<unknown>;
@@ -111,9 +111,10 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   return reject(404, 'not_found');
 }
 
-export async function handleScheduled(cron: string, scheduledTime: number, env: Env): Promise<number> {
-  const jobs = jobsForCron(cron);
-  const slot = new Date(scheduledTime);
+// The every-minute trigger: enqueue the jobs whose cron matches this minute (UTC).
+export async function handleScheduled(scheduledTime: number, env: Env): Promise<number> {
+  const slot = new Date(Math.floor(scheduledTime / 60_000) * 60_000);
+  const jobs = jobsDueAt(slot);
   for (const job of jobs) {
     await env.JOBS_QUEUE.send(jobEnvelope(job, `${job.name}:${slot.toISOString()}`, slot, 'jobs-cron'), { contentType: 'json' });
   }
@@ -134,7 +135,7 @@ export async function runJob(job: JobDef, message: JobEnvelope, env: Env): Promi
         'user-agent': 'solo-empire-jobs',
         'content-type': 'application/json',
       },
-      body: JSON.stringify({ ref: target.ref }),
+      body: JSON.stringify(target.inputs ? { ref: target.ref, inputs: target.inputs } : { ref: target.ref }),
       signal: AbortSignal.timeout(TARGET_TIMEOUT_MS),
     });
     return res.status === 204;
@@ -182,7 +183,7 @@ export default Sentry.withSentry((env: Env) => sentryOptions(env), {
     return handleRequest(request, env);
   },
   async scheduled(controller: ScheduledControllerLike, env: Env): Promise<void> {
-    await handleScheduled(controller.cron, controller.scheduledTime, env);
+    await handleScheduled(controller.scheduledTime, env);
   },
   queue(batch: MessageBatchLike<JobEnvelope>, env: Env): Promise<void> {
     return handleQueue(batch, env);
