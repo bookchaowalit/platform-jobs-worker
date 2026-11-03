@@ -42,7 +42,8 @@ export function parseCron(expression: string): Cron | null {
     fields.push(set);
   }
   if (fields[4].has(7)) fields[4].add(0);
-  return { fields, domRestricted: parts[2] !== '*', dowRestricted: parts[4] !== '*' };
+  // As in Vixie cron, a day field that starts with `*` (`*`, `*/n`) counts as unrestricted.
+  return { fields, domRestricted: !parts[2].startsWith('*'), dowRestricted: !parts[4].startsWith('*') };
 }
 
 export function cronMatches(cron: Cron, at: Date): boolean {

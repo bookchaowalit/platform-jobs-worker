@@ -28,6 +28,14 @@ test('day of month OR day of week when both are restricted', () => {
   assert.ok(!matches('0 0 1 * 1', '2026-11-03T00:00:00Z'));
 });
 
+test('a stepped wildcard day field keeps wildcard semantics (AND, not OR)', () => {
+  assert.ok(matches('0 0 */1 * 1', '2026-11-02T00:00:00Z')); // Monday
+  assert.ok(!matches('0 0 */1 * 1', '2026-11-03T00:00:00Z')); // Tuesday
+  assert.ok(matches('0 0 */2 * *', '2026-11-03T00:00:00Z')); // day 3
+  assert.ok(!matches('0 0 */2 * *', '2026-11-04T00:00:00Z'));
+  assert.ok(!matches('0 0 1 * */7', '2026-11-03T00:00:00Z')); // */7 = Sunday only, ANDed with the 1st
+});
+
 test('invalid expressions are rejected', () => {
   for (const bad of ['* * * *', '60 * * * *', '* 24 * * *', '*/0 * * * *', '5-1 * * * *', 'a * * * *', '* * 0 * *']) {
     assert.equal(parseCron(bad), null, bad);
