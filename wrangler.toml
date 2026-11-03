@@ -1,0 +1,36 @@
+name = "solo-empire-jobs"
+main = "src/worker.ts"
+compatibility_date = "2026-11-01"
+# @sentry/cloudflare needs AsyncLocalStorage.
+compatibility_flags = ["nodejs_als"]
+workers_dev = true
+
+# The account comes from CLOUDFLARE_ACCOUNT_ID (Infisical /cloudflare).
+
+# One cron string per schedule in src/jobs.ts (a test checks they match).
+[triggers]
+crons = ["47 */2 * * *"]
+
+# ADR-0008 queue plane. Created once with:
+#   wrangler queues create jobs && wrangler queues create jobs-dlq
+[[queues.producers]]
+binding = "JOBS_QUEUE"
+queue = "jobs"
+
+# Bound only to read the DLQ backlog for /healthz.
+[[queues.producers]]
+binding = "JOBS_DLQ"
+queue = "jobs-dlq"
+
+[[queues.consumers]]
+queue = "jobs"
+max_batch_size = 5
+max_batch_timeout = 10
+max_retries = 5
+dead_letter_queue = "jobs-dlq"
+
+# Worker secrets are never stored in this file; set them with `wrangler secret put`:
+#   JOBS_TOKEN             required for POST /enqueue (Infisical /jobs)
+#   GITHUB_DISPATCH_TOKEN  required for github_workflow jobs (Actions: write on the target repos)
+#   GATEWAY_TOKEN          optional, bearer for http jobs routed through the API gateway
+#   SENTRY_DSN             optional, error reporting (unset = off)
