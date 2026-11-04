@@ -55,6 +55,7 @@ Watched by the uptime Worker as `jobs-worker`.
 | `mcp-catalog-refresh` | `30 2 * * 1` | solo-empire | 2026-11-03 |
 | `event-sink` | `5 * * * *` | data-lake-pipelines `event-sink.yml` (input `source=jobs-queue`) | 2026-11-04 |
 | `knowledge-relay` | `55 * * * *` | platform-knowledge-api `relay-outbox.yml` (input `source=jobs-queue`) | 2026-11-04 |
+| `intake-relay` | `53 * * * *` | platform-intake-api `relay-outbox.yml` (input `source=jobs-queue`) | 2026-11-04 |
 
 Kept on the GitHub cron on purpose: life-dashboard-web `autopilot.yml` (a dispatch skips the
 `AUTOPILOT_ENABLED` gate and defaults to dry-run) and platform-ops-cli `ci-runner-failover.yml`

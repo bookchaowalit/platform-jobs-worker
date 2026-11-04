@@ -32,6 +32,8 @@ export const JOBS: readonly JobDef[] = [
   { name: 'free-cloud-e2e', cron: '17 3 * * 1', target: gh('data-lake-pipelines', 'free-cloud-e2e.yml') },
   { name: 'polyglot-bench', cron: '0 2 * * 1', target: gh('devtools-polyglot-benchmark', 'bench.yml') },
   { name: 'mcp-catalog-refresh', cron: '30 2 * * 1', target: gh('solo-empire', 'mcp-catalog-refresh.yml') },
+  // Intake event outbox → Kafka data.ingest.v1 (ADR-0008 M5, intake migration 0003); before event-sink at :05.
+  { name: 'intake-relay', cron: '53 * * * *', target: gh('platform-intake-api', 'relay-outbox.yml', { source: 'jobs-queue' }) },
   // Knowledge store outbox → Kafka (ADR-0008 M5, SPEC-003); runs before event-sink at :05.
   { name: 'knowledge-relay', cron: '55 * * * *', target: gh('platform-knowledge-api', 'relay-outbox.yml', { source: 'jobs-queue' }) },
   // Event plane → Bronze (ADR-0008 M4): heartbeat event, drain the Kafka topics, convert to Bronze.
