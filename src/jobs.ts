@@ -38,6 +38,8 @@ export const JOBS: readonly JobDef[] = [
   { name: 'knowledge-relay', cron: '55 * * * *', target: gh('platform-knowledge-api', 'relay-outbox.yml', { source: 'jobs-queue' }) },
   // Event plane → Bronze (ADR-0008 M4): heartbeat event, drain the Kafka topics, convert to Bronze.
   { name: 'event-sink', cron: '5 * * * *', target: gh('data-lake-pipelines', 'event-sink.yml', { source: 'jobs-queue' }) },
+  // Kafka → Telegram for payments and failed intakes (ADR-0008 consumer #1, SPEC-001); after the relays at :53/:55.
+  { name: 'event-notifier', cron: '58 * * * *', target: gh('platform-event-notifier', 'notify.yml', { source: 'jobs-queue' }) },
 ];
 
 const PARSED = new Map(JOBS.filter((job) => job.cron).map((job) => [job.name, parseCron(job.cron as string)]));
