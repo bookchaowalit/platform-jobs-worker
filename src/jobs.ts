@@ -40,6 +40,8 @@ export const JOBS: readonly JobDef[] = [
   { name: 'event-sink', cron: '5 * * * *', target: gh('data-lake-pipelines', 'event-sink.yml', { source: 'jobs-queue' }) },
   // Kafka → Telegram for payments and failed intakes (ADR-0008 consumer #1, SPEC-001); after the relays at :53/:55.
   { name: 'event-notifier', cron: '58 * * * *', target: gh('platform-event-notifier', 'notify.yml', { source: 'jobs-queue' }) },
+  // Dependabot alerts across own repos → Telegram on change (platform-vuln-digest SPEC-001); 08:17 Bangkok.
+  { name: 'vuln-digest', cron: '17 1 * * *', target: gh('platform-vuln-digest', 'digest.yml') },
 ];
 
 const PARSED = new Map(JOBS.filter((job) => job.cron).map((job) => [job.name, parseCron(job.cron as string)]));

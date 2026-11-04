@@ -57,6 +57,7 @@ Watched by the uptime Worker as `jobs-worker`.
 | `knowledge-relay` | `55 * * * *` | platform-knowledge-api `relay-outbox.yml` (input `source=jobs-queue`) | 2026-11-04 |
 | `intake-relay` | `53 * * * *` | platform-intake-api `relay-outbox.yml` (input `source=jobs-queue`) | 2026-11-04 |
 | `event-notifier` | `58 * * * *` | platform-event-notifier `notify.yml` (input `source=jobs-queue`) | 2026-11-04 |
+| `vuln-digest` | `17 1 * * *` | platform-vuln-digest `digest.yml` (new, no inputs) | 2026-11-04 |
 
 Kept on the GitHub cron on purpose: life-dashboard-web `autopilot.yml` (a dispatch skips the
 `AUTOPILOT_ENABLED` gate and defaults to dry-run) and platform-ops-cli `ci-runner-failover.yml`
