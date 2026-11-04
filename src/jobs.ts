@@ -32,6 +32,8 @@ export const JOBS: readonly JobDef[] = [
   { name: 'free-cloud-e2e', cron: '17 3 * * 1', target: gh('data-lake-pipelines', 'free-cloud-e2e.yml') },
   { name: 'polyglot-bench', cron: '0 2 * * 1', target: gh('devtools-polyglot-benchmark', 'bench.yml') },
   { name: 'mcp-catalog-refresh', cron: '30 2 * * 1', target: gh('solo-empire', 'mcp-catalog-refresh.yml') },
+  // Event plane → Bronze (ADR-0008 M4): heartbeat event, drain the Kafka topics, convert to Bronze.
+  { name: 'event-sink', cron: '5 * * * *', target: gh('data-lake-pipelines', 'event-sink.yml', { source: 'jobs-queue' }) },
 ];
 
 const PARSED = new Map(JOBS.filter((job) => job.cron).map((job) => [job.name, parseCron(job.cron as string)]));
