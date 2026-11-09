@@ -25,6 +25,8 @@ const gh = (repo: string, workflow: string, inputs?: Record<string, string>): Jo
 export const JOBS: readonly JobDef[] = [
   // Jobs Bronze → Silver → Gold; `source` makes the run behave like a scheduled one (no forced BI deploy).
   { name: 'jobs-marts', cron: '47 */2 * * *', target: gh('data-lake-pipelines', 'jobs-marts.yml', { source: 'jobs-queue' }) },
+  // News Bronze → Silver → Gold → news-insights BI (docs/specs/news-marts.md); 20 min after news-capture (:15 every 2 h).
+  { name: 'news-marts', cron: '35 */2 * * *', target: gh('data-lake-pipelines', 'news-marts.yml', { source: 'jobs-queue' }) },
   // Track B job capture into Bronze (feeds jobs-marts 30 min later).
   { name: 'career-job-capture', cron: '17 */6 * * *', target: gh('career-job-scraper', 'scheduled-capture.yml') },
   { name: 'org-hub-sync', cron: '0 2 * * *', target: gh('platform-ops-cli', 'org-hub-sync.yml') },
