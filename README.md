@@ -50,6 +50,7 @@ Watched by the uptime Worker as `jobs-worker`.
 | `news-marts` | `35 */2 * * *` | data-lake-pipelines `news-marts.yml` (input `source=jobs-queue`) | 2026-11-09 |
 | `sales-marts` | `20 * * * *` | data-lake-pipelines `sales-marts.yml` (input `source=jobs-queue`) | 2026-11-09 |
 | `github-activity` | `10 3 * * *` | data-lake-pipelines `github-activity.yml` | 2026-11-12 (new) |
+| `hf-trending` | `40 3 * * *` | data-lake-pipelines `hf-trending.yml` | 2026-11-12 (new) |
 | `career-job-capture` | `17 */6 * * *` | career-job-scraper `scheduled-capture.yml` | 2026-11-03 |
 | `org-hub-sync` | `0 2 * * *` | platform-ops-cli `org-hub-sync.yml` | 2026-11-03 |
 | `data-lake-cloud-contract` | `30 2 * * 1` | data-lake-pipelines | 2026-11-03 |

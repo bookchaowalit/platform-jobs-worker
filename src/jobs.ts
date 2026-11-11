@@ -31,6 +31,8 @@ export const JOBS: readonly JobDef[] = [
   { name: 'news-marts', cron: '35 */2 * * *', target: gh('data-lake-pipelines', 'news-marts.yml', { source: 'jobs-queue' }) },
   // Owner's public GitHub repos + events → Bronze (data-lake-pipelines docs/specs/github-activity.md); daily.
   { name: 'github-activity', cron: '10 3 * * *', target: gh('data-lake-pipelines', 'github-activity.yml') },
+  // Hugging Face trending models/datasets/spaces → Bronze (data-lake-pipelines docs/specs/hf-trending.md); daily.
+  { name: 'hf-trending', cron: '40 3 * * *', target: gh('data-lake-pipelines', 'hf-trending.yml') },
   // Track B job capture into Bronze (feeds jobs-marts 30 min later).
   { name: 'career-job-capture', cron: '17 */6 * * *', target: gh('career-job-scraper', 'scheduled-capture.yml') },
   { name: 'org-hub-sync', cron: '0 2 * * *', target: gh('platform-ops-cli', 'org-hub-sync.yml') },
