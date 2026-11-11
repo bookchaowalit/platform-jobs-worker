@@ -40,12 +40,12 @@ function message(body: JobEnvelope, attempts = 1) {
   return { m, state };
 }
 
-test('schedules the ten finance outbox relays hourly at :41-:50 (SPEC-005)', () => {
+test('schedules the ten finance outbox relays hourly at :36-:45 (SPEC-005)', () => {
   const cells = ['budgets', 'accounts', 'transactions', 'cash-flow', 'reconciliations', 'business-assets', 'investments', 'liabilities', 'subscriptions', 'tax'];
   cells.forEach((cell, n) => {
     const job = JOBS.find((j) => j.name === `finance-relay-${cell}`);
     assert.ok(job, cell);
-    assert.equal(job.cron, `${41 + n} * * * *`);
+    assert.equal(job.cron, `${36 + n} * * * *`);
     assert.deepEqual(job.target, { kind: 'github_workflow', repo: `bookchaowalit/finance-${cell}-api`, workflow: 'relay-outbox.yml', ref: 'main', inputs: { source: 'jobs-queue' } });
   });
 });
