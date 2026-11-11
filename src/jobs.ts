@@ -39,6 +39,10 @@ export const JOBS: readonly JobDef[] = [
   // Intake event outbox → Kafka data.ingest.v1 (ADR-0008 M5, intake migration 0003); before event-sink at :05.
   { name: 'intake-relay', cron: '53 * * * *', target: gh('platform-intake-api', 'relay-outbox.yml', { source: 'jobs-queue' }) },
   // Knowledge store outbox → Kafka (ADR-0008 M5, SPEC-003); runs before event-sink at :05.
+  // Finance outboxes → Kafka finance.events.v1 (finance-<cell>-api relay-outbox.yml, SPEC-005), one per cell at
+  // :41–:50, before the lake sink at :05; heartbeats finance-relay-<cell> in the uptime Worker.
+  ...['budgets', 'accounts', 'transactions', 'cash-flow', 'reconciliations', 'business-assets', 'investments', 'liabilities', 'subscriptions', 'tax']
+    .map((cell, n): JobDef => ({ name: `finance-relay-${cell}`, cron: `${41 + n} * * * *`, target: gh(`finance-${cell}-api`, 'relay-outbox.yml', { source: 'jobs-queue' }) })),
   { name: 'knowledge-relay', cron: '55 * * * *', target: gh('platform-knowledge-api', 'relay-outbox.yml', { source: 'jobs-queue' }) },
   // Event plane → Bronze (ADR-0008 M4): heartbeat event, drain the Kafka topics, convert to Bronze.
   { name: 'event-sink', cron: '5 * * * *', target: gh('data-lake-pipelines', 'event-sink.yml', { source: 'jobs-queue' }) },
