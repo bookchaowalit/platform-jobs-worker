@@ -55,6 +55,9 @@ export const JOBS: readonly JobDef[] = [
   { name: 'event-notifier', cron: '58 * * * *', target: gh('platform-event-notifier', 'notify.yml', { source: 'jobs-queue' }) },
   // Dependabot alerts across own repos → Telegram on change (platform-vuln-digest SPEC-001); 08:17 Bangkok.
   { name: 'vuln-digest', cron: '17 1 * * *', target: gh('platform-vuln-digest', 'digest.yml') },
+  // Attack detection every 15 min at :07/:22/:37/:52 (off the busy :00/:30): Cloudflare + Railway logs → R2 →
+  // Telegram on change (platform-security-signals SPEC-001).
+  { name: 'security-signals', cron: '7-59/15 * * * *', target: gh('platform-security-signals', 'signals.yml') },
 ];
 
 const PARSED = new Map(JOBS.filter((job) => job.cron).map((job) => [job.name, parseCron(job.cron as string)]));

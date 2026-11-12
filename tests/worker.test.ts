@@ -71,6 +71,10 @@ test('a minute tick enqueues only the jobs due then, with a deterministic id per
   sent.length = 0;
   assert.equal(await handleScheduled(Date.UTC(2026, 10, 2, 2, 30), env), 2);
   assert.deepEqual(sent.map((m) => m.data.job).sort(), ['data-lake-cloud-contract', 'mcp-catalog-refresh']);
+  // security-signals runs every 15 min at :07/:22/:37/:52.
+  sent.length = 0;
+  assert.equal(await handleScheduled(Date.UTC(2026, 10, 3, 14, 52), env), 1);
+  assert.equal(sent[0].data.job, 'security-signals');
 });
 
 test('/enqueue needs the bearer credential and a registered job', async () => {
