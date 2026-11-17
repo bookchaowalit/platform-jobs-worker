@@ -60,6 +60,12 @@ export const JOBS: readonly JobDef[] = [
   // Attack detection every 15 min at :07/:22/:37/:52 (off the busy :00/:30): Cloudflare + Railway logs → R2 →
   // Telegram on change (platform-security-signals SPEC-001).
   { name: 'security-signals', cron: '7-59/15 * * * *', target: gh('platform-security-signals', 'signals.yml') },
+  // Security posture monitor every 6 h at :23 (platform-posture-monitor SPEC-001). Moved from the workflow
+  // schedule 2026-11-17: GitHub dropped two runs in a row on 2026-11-16 (15.5 h gap, heartbeat 13 h).
+  { name: 'posture-monitor', cron: '23 */6 * * *', target: gh('platform-posture-monitor', 'posture.yml') },
+  // Uptime Worker watchdog, hourly at :49, offset from its own GitHub schedule at :17 (which stays, so the
+  // watchdog does not depend on Cloudflare alone). GitHub skipped ~10 h of hourly runs on 2026-11-16.
+  { name: 'monitor-watchdog', cron: '49 * * * *', target: gh('platform-uptime-worker', 'watchdog.yml') },
 ];
 
 const PARSED = new Map(JOBS.filter((job) => job.cron).map((job) => [job.name, parseCron(job.cron as string)]));
