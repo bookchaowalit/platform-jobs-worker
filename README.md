@@ -58,6 +58,8 @@ Watched by the uptime Worker as `jobs-worker`.
 | `polyglot-bench` | `0 2 * * 1` | devtools-polyglot-benchmark `bench.yml` | 2026-11-03 |
 | `mcp-catalog-refresh` | `30 2 * * 1` | bookchaowalit-empire (solo-empire until 2026-11-12) | 2026-11-03 |
 | `event-sink` | `5 * * * *` | data-lake-pipelines `event-sink.yml` (input `source=jobs-queue`) | 2026-11-04 |
+| `posture-monitor` | `23 */6 * * *` | platform-posture-monitor `posture.yml` | 2026-11-17 |
+| `monitor-watchdog` | `49 * * * *` | platform-uptime-worker `watchdog.yml` (its `:17` schedule stays) | 2026-11-17 (added) |
 | `knowledge-relay` | `55 * * * *` | platform-knowledge-api `relay-outbox.yml` (input `source=jobs-queue`) | 2026-11-04 |
 | `intake-relay` | `53 * * * *` | platform-intake-api `relay-outbox.yml` (input `source=jobs-queue`) | 2026-11-04 |
 | `event-notifier` | `58 * * * *` | platform-event-notifier `notify.yml` (input `source=jobs-queue`) | 2026-11-04 |

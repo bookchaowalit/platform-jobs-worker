@@ -75,6 +75,13 @@ test('a minute tick enqueues only the jobs due then, with a deterministic id per
   sent.length = 0;
   assert.equal(await handleScheduled(Date.UTC(2026, 10, 3, 14, 52), env), 1);
   assert.equal(sent[0].data.job, 'security-signals');
+  // The uptime watchdog at :49 and the posture monitor every 6 h at :23 (moved off GitHub schedules).
+  sent.length = 0;
+  assert.equal(await handleScheduled(Date.UTC(2026, 10, 3, 14, 49), env), 1);
+  assert.equal(sent[0].data.job, 'monitor-watchdog');
+  sent.length = 0;
+  assert.equal(await handleScheduled(Date.UTC(2026, 10, 3, 18, 23), env), 1);
+  assert.equal(sent[0].data.job, 'posture-monitor');
 });
 
 test('/enqueue needs the bearer credential and a registered job', async () => {
