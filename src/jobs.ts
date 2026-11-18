@@ -35,6 +35,9 @@ export const JOBS: readonly JobDef[] = [
   { name: 'hf-trending', cron: '40 3 * * *', target: gh('data-lake-pipelines', 'hf-trending.yml') },
   // Top Wikipedia articles th + en → Bronze (data-lake-pipelines docs/specs/wiki-pageviews.md); daily, heartbeat 26 h.
   { name: 'wiki-pageviews', cron: '50 3 * * *', target: gh('data-lake-pipelines', 'wiki-pageviews.yml') },
+  // Every free RSS/Atom feed, keyless API and robots-allowed page in open-feeds.yaml → Bronze
+  // (data-lake-pipelines docs/specs/open-feeds.md); hourly at :25 (free minute), heartbeat 3 h.
+  { name: 'open-feeds', cron: '25 * * * *', target: gh('data-lake-pipelines', 'open-feeds.yml') },
   // Track B job capture into Bronze (feeds jobs-marts 30 min later).
   { name: 'career-job-capture', cron: '17 */6 * * *', target: gh('career-job-scraper', 'scheduled-capture.yml') },
   { name: 'org-hub-sync', cron: '0 2 * * *', target: gh('platform-ops-cli', 'org-hub-sync.yml') },
