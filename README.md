@@ -10,6 +10,7 @@ Cloudflare cron ─┐                                      ┌─ github_workfl
 POST /enqueue ───┴─► queue `jobs` ─► consumer (retry) ──┤
                                          │              └─ http → target via gateway (bearer)
                                          └─ after 5 retries ─► `jobs-dlq` ─► /healthz 503 ─► uptime alert
+                                                                 └─ cleared once a later run succeeded
 ```
 
 ## Behavior
@@ -19,6 +20,7 @@ POST /enqueue ───┴─► queue `jobs` ─► consumer (retry) ──┤
 | `scheduled` | One every-minute trigger (Workers Free allows 5 cron triggers per account). Each minute, `src/cron.ts` matches every job's own UTC cron and enqueues the due jobs. Message id = `<job>:<slot ISO time>`. |
 | `POST /enqueue` | Bearer `JOBS_TOKEN`; body `{"job":"<name>"}`. Only jobs in the registry are accepted (`404 unknown_job`), so it can never call an arbitrary URL. `202 {"queued":true,"id":...}`. |
 | `queue` (`jobs`) | Runs the job target. `github_workflow`: `POST /repos/{repo}/actions/workflows/{wf}/dispatches` with the job's `inputs`, ack on `204`. `http`: POST the envelope with a bearer and `idempotency-key`, ack on 2xx. Otherwise retry after 60 s × attempt; after 5 retries → `jobs-dlq`. |
+| `queue` (`jobs-dlq`) | Never runs a job again. On arrival and every 15 min after, it reads the workflow's runs (`status=success`, the job's `ref`, `created>=` the parked slot) and acks the message once one exists, so the alert clears by itself. Until then it stays parked (retry, delay 15 min, up to 100 checks, no DLQ of its own; queue retention may drop it earlier). An `http` job has no run history and stays until it expires; a job no longer in the registry is dropped. |
 | `GET /healthz` | `200 {"ok":true,"dlq_backlog":0}`; `503` while `jobs-dlq` holds messages, which the uptime Worker (`jobs-worker` target) turns into a Telegram alert. |
 
 Message body = ADR-0008 envelope: `{id,type:"job.<name>.requested",version,occurred_at,producer,correlation_id,causation_id,data:{job}}`.

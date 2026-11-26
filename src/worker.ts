@@ -1,5 +1,7 @@
 // Job queue Worker (ADR-0008 queue plane). Schedulers only enqueue; this Worker's queue consumer
 // runs each job's target with retries, and after max_retries the message moves to jobs-dlq.
+// The jobs-dlq consumer never runs a job again: it clears a parked job once a later run of the
+// same workflow has succeeded, and keeps it (so /healthz stays 503) until then.
 
 import * as Sentry from '@sentry/cloudflare';
 import { sentryOptions } from './sentry.js';
@@ -33,6 +35,9 @@ export interface MessageBatchLike<T> {
 }
 
 export const RETRY_DELAY_SECONDS = 60;
+// How often a parked job is checked again for a later successful run.
+export const DLQ_RECHECK_SECONDS = 15 * 60;
+export const DLQ_QUEUE = 'jobs-dlq';
 export const TARGET_TIMEOUT_MS = 15_000;
 const MAX_BODY_BYTES = 4 * 1024;
 
@@ -121,6 +126,15 @@ export async function handleScheduled(scheduledTime: number, env: Env): Promise<
   return jobs.length;
 }
 
+function githubHeaders(token: string): Record<string, string> {
+  return {
+    authorization: `Bearer ${token}`,
+    accept: 'application/vnd.github+json',
+    'x-github-api-version': '2022-11-28',
+    'user-agent': 'solo-empire-jobs',
+  };
+}
+
 // Returns true when the target accepted the job.
 export async function runJob(job: JobDef, message: JobEnvelope, env: Env): Promise<boolean> {
   const target = job.target;
@@ -128,13 +142,7 @@ export async function runJob(job: JobDef, message: JobEnvelope, env: Env): Promi
     if (!env.GITHUB_DISPATCH_TOKEN) return false;
     const res = await fetch(`https://api.github.com/repos/${target.repo}/actions/workflows/${target.workflow}/dispatches`, {
       method: 'POST',
-      headers: {
-        authorization: `Bearer ${env.GITHUB_DISPATCH_TOKEN}`,
-        accept: 'application/vnd.github+json',
-        'x-github-api-version': '2022-11-28',
-        'user-agent': 'solo-empire-jobs',
-        'content-type': 'application/json',
-      },
+      headers: { ...githubHeaders(env.GITHUB_DISPATCH_TOKEN), 'content-type': 'application/json' },
       body: JSON.stringify(target.inputs ? { ref: target.ref, inputs: target.inputs } : { ref: target.ref }),
       signal: AbortSignal.timeout(TARGET_TIMEOUT_MS),
     });
@@ -151,7 +159,54 @@ export async function runJob(job: JobDef, message: JobEnvelope, env: Env): Promi
   return res.ok;
 }
 
+// True when a run of the job's workflow on its ref, created at or after the parked slot, succeeded.
+// http jobs have no run history to read, so they stay parked until the message expires.
+export async function laterRunSucceeded(job: JobDef, message: JobEnvelope, env: Env): Promise<boolean> {
+  const target = job.target;
+  if (target.kind !== 'github_workflow' || !env.GITHUB_DISPATCH_TOKEN) return false;
+  const slot = new Date(message.occurred_at);
+  if (Number.isNaN(slot.getTime())) return false;
+  const url = new URL(`https://api.github.com/repos/${target.repo}/actions/workflows/${target.workflow}/runs`);
+  url.searchParams.set('status', 'success');
+  url.searchParams.set('branch', target.ref);
+  url.searchParams.set('created', `>=${slot.toISOString()}`);
+  url.searchParams.set('per_page', '1');
+  const res = await fetch(url.toString(), {
+    method: 'GET',
+    headers: githubHeaders(env.GITHUB_DISPATCH_TOKEN),
+    signal: AbortSignal.timeout(TARGET_TIMEOUT_MS),
+  });
+  if (!res.ok) return false;
+  const body = (await res.json()) as { total_count?: unknown };
+  return typeof body.total_count === 'number' && body.total_count > 0;
+}
+
+async function handleDeadLetters(batch: MessageBatchLike<JobEnvelope>, env: Env): Promise<void> {
+  for (const message of batch.messages) {
+    const name = message.body?.data?.job;
+    const job = typeof name === 'string' ? findJob(name) : undefined;
+    if (!job) {
+      console.warn('jobs-dlq: unknown job dropped', message.id);
+      message.ack();
+      continue;
+    }
+    let cleared = false;
+    try {
+      cleared = await laterRunSucceeded(job, message.body, env);
+    } catch {
+      cleared = false;
+    }
+    if (cleared) {
+      console.log('jobs-dlq: cleared, a later run succeeded', message.body.id);
+      message.ack();
+    } else {
+      message.retry({ delaySeconds: DLQ_RECHECK_SECONDS });
+    }
+  }
+}
+
 export async function handleQueue(batch: MessageBatchLike<JobEnvelope>, env: Env): Promise<void> {
+  if (batch.queue === DLQ_QUEUE) return handleDeadLetters(batch, env);
   for (const message of batch.messages) {
     const name = message.body?.data?.job;
     const job = typeof name === 'string' ? findJob(name) : undefined;

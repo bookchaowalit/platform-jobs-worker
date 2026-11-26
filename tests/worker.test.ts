@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { afterEach, test } from 'node:test';
 import { parseCron } from '../src/cron.js';
 import { JOBS } from '../src/jobs.js';
-import { handleQueue, handleRequest, handleScheduled, jobEnvelope, type Env, type JobEnvelope, type MessageLike } from '../src/worker.js';
+import { DLQ_RECHECK_SECONDS, handleQueue, handleRequest, handleScheduled, jobEnvelope, type Env, type JobEnvelope, type MessageLike } from '../src/worker.js';
 
 // Test-only fixtures; not real credentials.
 const jobsCredential = ['fixture', 'jobs', 'value'].join('-');
@@ -145,4 +145,76 @@ test('/healthz answers 503 when the DLQ holds parked jobs', async () => {
   const bad = await handleRequest(new Request('https://jobs.example.com/healthz'), parked.env);
   assert.equal(bad.status, 503);
   assert.deepEqual(await bad.json(), { ok: false, dlq_backlog: 2 });
+});
+
+// jobs-dlq consumer: a parked job clears itself once a later run of the same job has succeeded.
+test('DLQ consumer acks a parked job once a later run of the same workflow succeeded', async () => {
+  const calls: { url: string; init: RequestInit }[] = [];
+  globalThis.fetch = (async (url: string, init: RequestInit) => {
+    calls.push({ url, init });
+    return Response.json({ total_count: 1, workflow_runs: [{ id: 1 }] });
+  }) as typeof fetch;
+  const slot = new Date('2026-11-25T15:45:00.000Z');
+  const { m, state } = message(jobEnvelope(marts, 'jobs-marts:2026-11-25T15:45:00.000Z', slot, 'jobs-cron'), 1);
+  await handleQueue({ queue: 'jobs-dlq', messages: [m] }, makeEnv().env);
+  assert.equal(state.acked, true);
+  assert.equal(calls.length, 1, 'only reads runs, never dispatches again');
+  const url = new URL(calls[0].url);
+  assert.equal(url.pathname, '/repos/bookchaowalit/data-lake-pipelines/actions/workflows/jobs-marts.yml/runs');
+  assert.equal(url.searchParams.get('status'), 'success');
+  assert.equal(url.searchParams.get('branch'), 'main');
+  assert.equal(url.searchParams.get('created'), '>=2026-11-25T15:45:00.000Z');
+  assert.equal(calls[0].init.method ?? 'GET', 'GET');
+  assert.equal((calls[0].init.headers as Record<string, string>).authorization, `Bearer ${dispatchCredential}`);
+  assert.ok(calls[0].init.signal instanceof AbortSignal, 'the runs read is bounded by a timeout');
+});
+
+test('DLQ consumer keeps a parked job (delayed recheck) until a later run succeeds', async () => {
+  globalThis.fetch = (async () => Response.json({ total_count: 0, workflow_runs: [] })) as typeof fetch;
+  const none = message(jobEnvelope(marts, 'e', new Date(), 'jobs-cron'), 4);
+  await handleQueue({ queue: 'jobs-dlq', messages: [none.m] }, makeEnv().env);
+  assert.equal(none.state.acked, false);
+  assert.equal(none.state.retryDelay, DLQ_RECHECK_SECONDS);
+
+  globalThis.fetch = (async () => new Response('forbidden', { status: 403 })) as typeof fetch;
+  const denied = message(jobEnvelope(marts, 'f', new Date(), 'jobs-cron'));
+  await handleQueue({ queue: 'jobs-dlq', messages: [denied.m] }, makeEnv().env);
+  assert.equal(denied.state.acked, false);
+  assert.equal(denied.state.retryDelay, DLQ_RECHECK_SECONDS);
+
+  globalThis.fetch = (async () => { throw new Error('offline'); }) as typeof fetch;
+  const offline = message(jobEnvelope(marts, 'g', new Date(), 'jobs-cron'));
+  await handleQueue({ queue: 'jobs-dlq', messages: [offline.m] }, makeEnv().env);
+  assert.equal(offline.state.acked, false);
+
+  let fetched = false;
+  globalThis.fetch = (async () => { fetched = true; return Response.json({ total_count: 1 }); }) as typeof fetch;
+  const noCredential = message(jobEnvelope(marts, 'h', new Date(), 'jobs-cron'));
+  await handleQueue({ queue: 'jobs-dlq', messages: [noCredential.m] }, makeEnv({ GITHUB_DISPATCH_TOKEN: undefined }).env);
+  assert.equal(noCredential.state.acked, false);
+  assert.equal(fetched, false);
+
+  globalThis.fetch = (async () => Response.json({ total_count: 1 })) as typeof fetch;
+  const badSlot = message({ ...jobEnvelope(marts, 'i', new Date(), 'jobs-cron'), occurred_at: 'not-a-date' });
+  await handleQueue({ queue: 'jobs-dlq', messages: [badSlot.m] }, makeEnv().env);
+  assert.equal(badSlot.state.acked, false, 'no slot time, no proof of a later run');
+});
+
+test('DLQ consumer never dispatches and drops a job that is no longer registered', async () => {
+  let fetched = false;
+  globalThis.fetch = (async () => { fetched = true; return new Response(null, { status: 204 }); }) as typeof fetch;
+  const body = { ...jobEnvelope(marts, 'j', new Date(), 'jobs-cron'), data: { job: 'removed-job' } };
+  const { m, state } = message(body);
+  await handleQueue({ queue: 'jobs-dlq', messages: [m] }, makeEnv().env);
+  assert.equal(state.acked, true);
+  assert.equal(fetched, false);
+});
+
+test('wrangler.toml consumes jobs-dlq with the recheck consumer', () => {
+  const toml = readFileSync(new URL('../wrangler.toml', import.meta.url), 'utf8');
+  const consumers = toml.split('[[queues.consumers]]').slice(1);
+  const dlq = consumers.find((block) => /^queue = "jobs-dlq"$/m.test(block));
+  assert.ok(dlq, 'jobs-dlq has a consumer');
+  assert.doesNotMatch(dlq, /dead_letter_queue/, 'no DLQ of the DLQ');
+  assert.match(dlq, /max_retries = 100/);
 });

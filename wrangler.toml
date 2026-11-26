@@ -18,7 +18,7 @@ crons = ["* * * * *"]
 binding = "JOBS_QUEUE"
 queue = "jobs"
 
-# Bound only to read the DLQ backlog for /healthz.
+# Bound to read the DLQ backlog for /healthz.
 [[queues.producers]]
 binding = "JOBS_DLQ"
 queue = "jobs-dlq"
@@ -35,3 +35,13 @@ dead_letter_queue = "jobs-dlq"
 #   GITHUB_DISPATCH_TOKEN  required for github_workflow jobs (Actions: write on the target repos)
 #   GATEWAY_TOKEN          optional, bearer for http jobs routed through the API gateway
 #   SENTRY_DSN             optional, error reporting (unset = off)
+
+# Parked jobs: never run again here. Each is checked every 15 min (DLQ_RECHECK_SECONDS) and acked
+# once a later run of the same workflow succeeded; until then it stays and /healthz answers 503.
+# It has no DLQ of its own: a job still unresolved after 100 checks (~25 h) is dropped, and the
+# queue's message retention may drop it earlier. The uptime alert has fired by then.
+[[queues.consumers]]
+queue = "jobs-dlq"
+max_batch_size = 10
+max_batch_timeout = 30
+max_retries = 100
