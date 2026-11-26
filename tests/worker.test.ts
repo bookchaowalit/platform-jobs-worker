@@ -240,9 +240,14 @@ test('DLQ consumer re-parks an unresolved job before queue retention can drop it
   assert.deepEqual(resent[0].body, body);
   assert.deepEqual(resent[0].options, { contentType: 'json', delaySeconds: DLQ_MAX_RECHECK_SECONDS });
 
+  const nearing = message(body, 5, new Date(Date.now() - DLQ_RESEND_AFTER_MS + 3600_000));
+  await handleQueue({ queue: 'jobs-dlq', messages: [nearing.m] }, env);
+  assert.equal(nearing.state.acked, true, 'a 6 h recheck would land past 18 h, so re-park now');
+  assert.equal(resent.length, 2);
+
   const fresh = message(body, 2, new Date());
   await handleQueue({ queue: 'jobs-dlq', messages: [fresh.m] }, env);
-  assert.equal(resent.length, 1, 'a young copy is only retried');
+  assert.equal(resent.length, 2, 'a young copy is only retried');
   assert.equal(fresh.state.retryDelay, DLQ_MAX_RECHECK_SECONDS);
 
   const failing = makeEnv({ JOBS_DLQ: { async send() { throw new Error('queue down'); } } }).env;

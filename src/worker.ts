@@ -42,7 +42,7 @@ export const RETRY_DELAY_SECONDS = 60;
 export const DLQ_MIN_RECHECK_SECONDS = 15 * 60;
 export const DLQ_MAX_RECHECK_SECONDS = 6 * 3600;
 // Queue retention (24 h on Workers Free) or max_retries would silently drop an unresolved job and
-// turn /healthz green; a copy older than this is sent to jobs-dlq again first.
+// turn /healthz green; a copy whose next recheck would land past this age is sent to jobs-dlq again.
 export const DLQ_RESEND_AFTER_MS = 18 * 3600_000;
 export const DLQ_QUEUE = 'jobs-dlq';
 export const TARGET_TIMEOUT_MS = 15_000;
@@ -216,7 +216,9 @@ async function handleDeadLetters(batch: MessageBatchLike<JobEnvelope>, env: Env)
       continue;
     }
     const delaySeconds = dlqRecheckDelay(message.body.occurred_at);
-    if (Date.now() - message.timestamp.getTime() < DLQ_RESEND_AFTER_MS) {
+    // Retry only when the next delivery still lands before 18 h of this copy's age (6 h of slack
+    // to the 24 h retention); otherwise re-park a fresh copy now.
+    if (Date.now() - message.timestamp.getTime() + delaySeconds * 1000 < DLQ_RESEND_AFTER_MS) {
       message.retry({ delaySeconds });
       continue;
     }
