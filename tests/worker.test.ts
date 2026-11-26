@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { afterEach, test } from 'node:test';
 import { parseCron } from '../src/cron.js';
 import { JOBS } from '../src/jobs.js';
-import { handleQueue, handleRequest, handleScheduled, jobEnvelope, type Env, type JobEnvelope, type MessageLike } from '../src/worker.js';
+import { DLQ_MAX_RECHECK_SECONDS, DLQ_MIN_RECHECK_SECONDS, DLQ_RESEND_AFTER_MS, dlqRecheckDelay, handleQueue, handleRequest, handleScheduled, jobEnvelope, type Env, type JobEnvelope, type MessageLike } from '../src/worker.js';
 
 // Test-only fixtures; not real credentials.
 const jobsCredential = ['fixture', 'jobs', 'value'].join('-');
@@ -30,10 +30,10 @@ function enqueue(body: unknown, credential = jobsCredential) {
   });
 }
 
-function message(body: JobEnvelope, attempts = 1) {
+function message(body: JobEnvelope, attempts = 1, timestamp = new Date()) {
   const state = { acked: false, retryDelay: undefined as number | undefined };
   const m: MessageLike<JobEnvelope> = {
-    id: 'm1', body, attempts,
+    id: 'm1', body, attempts, timestamp,
     ack() { state.acked = true; },
     retry(options) { state.retryDelay = options?.delaySeconds ?? 0; },
   };
@@ -145,4 +145,114 @@ test('/healthz answers 503 when the DLQ holds parked jobs', async () => {
   const bad = await handleRequest(new Request('https://jobs.example.com/healthz'), parked.env);
   assert.equal(bad.status, 503);
   assert.deepEqual(await bad.json(), { ok: false, dlq_backlog: 2 });
+});
+
+// jobs-dlq consumer: a parked job clears itself once a later run of the same job has succeeded.
+test('DLQ consumer acks a parked job once a later run of the same workflow succeeded', async () => {
+  const calls: { url: string; init: RequestInit }[] = [];
+  globalThis.fetch = (async (url: string, init: RequestInit) => {
+    calls.push({ url, init });
+    return Response.json({ total_count: 1, workflow_runs: [{ id: 1 }] });
+  }) as typeof fetch;
+  const slot = new Date('2026-11-25T15:45:00.000Z');
+  const { m, state } = message(jobEnvelope(marts, 'jobs-marts:2026-11-25T15:45:00.000Z', slot, 'jobs-cron'), 1);
+  await handleQueue({ queue: 'jobs-dlq', messages: [m] }, makeEnv().env);
+  assert.equal(state.acked, true);
+  assert.equal(calls.length, 1, 'only reads runs, never dispatches again');
+  const url = new URL(calls[0].url);
+  assert.equal(url.pathname, '/repos/bookchaowalit/data-lake-pipelines/actions/workflows/jobs-marts.yml/runs');
+  assert.equal(url.searchParams.get('status'), 'success');
+  assert.equal(url.searchParams.get('branch'), 'main');
+  assert.equal(url.searchParams.get('created'), '>=2026-11-25T15:45:00.000Z');
+  assert.equal(calls[0].init.method ?? 'GET', 'GET');
+  assert.equal((calls[0].init.headers as Record<string, string>).authorization, `Bearer ${dispatchCredential}`);
+  assert.ok(calls[0].init.signal instanceof AbortSignal, 'the runs read is bounded by a timeout');
+});
+
+test('DLQ consumer keeps a parked job (delayed recheck) until a later run succeeds', async () => {
+  globalThis.fetch = (async () => Response.json({ total_count: 0, workflow_runs: [] })) as typeof fetch;
+  const none = message(jobEnvelope(marts, 'e', new Date(), 'jobs-cron'), 4);
+  await handleQueue({ queue: 'jobs-dlq', messages: [none.m] }, makeEnv().env);
+  assert.equal(none.state.acked, false);
+  assert.equal(none.state.retryDelay, DLQ_MIN_RECHECK_SECONDS);
+
+  globalThis.fetch = (async () => new Response('forbidden', { status: 403 })) as typeof fetch;
+  const denied = message(jobEnvelope(marts, 'f', new Date(), 'jobs-cron'));
+  await handleQueue({ queue: 'jobs-dlq', messages: [denied.m] }, makeEnv().env);
+  assert.equal(denied.state.acked, false);
+  assert.equal(denied.state.retryDelay, DLQ_MIN_RECHECK_SECONDS);
+
+  globalThis.fetch = (async () => { throw new Error('offline'); }) as typeof fetch;
+  const offline = message(jobEnvelope(marts, 'g', new Date(), 'jobs-cron'));
+  await handleQueue({ queue: 'jobs-dlq', messages: [offline.m] }, makeEnv().env);
+  assert.equal(offline.state.acked, false);
+
+  let fetched = false;
+  globalThis.fetch = (async () => { fetched = true; return Response.json({ total_count: 1 }); }) as typeof fetch;
+  const noCredential = message(jobEnvelope(marts, 'h', new Date(), 'jobs-cron'));
+  await handleQueue({ queue: 'jobs-dlq', messages: [noCredential.m] }, makeEnv({ GITHUB_DISPATCH_TOKEN: undefined }).env);
+  assert.equal(noCredential.state.acked, false);
+  assert.equal(fetched, false);
+
+  globalThis.fetch = (async () => Response.json({ total_count: 1 })) as typeof fetch;
+  const badSlot = message({ ...jobEnvelope(marts, 'i', new Date(), 'jobs-cron'), occurred_at: 'not-a-date' });
+  await handleQueue({ queue: 'jobs-dlq', messages: [badSlot.m] }, makeEnv().env);
+  assert.equal(badSlot.state.acked, false, 'no slot time, no proof of a later run');
+});
+
+test('DLQ consumer never dispatches and drops a job that is no longer registered', async () => {
+  let fetched = false;
+  globalThis.fetch = (async () => { fetched = true; return new Response(null, { status: 204 }); }) as typeof fetch;
+  const body = { ...jobEnvelope(marts, 'j', new Date(), 'jobs-cron'), data: { job: 'removed-job' } };
+  const { m, state } = message(body);
+  await handleQueue({ queue: 'jobs-dlq', messages: [m] }, makeEnv().env);
+  assert.equal(state.acked, true);
+  assert.equal(fetched, false);
+});
+
+test('wrangler.toml consumes jobs-dlq with the recheck consumer', () => {
+  const toml = readFileSync(new URL('../wrangler.toml', import.meta.url), 'utf8');
+  const consumers = toml.split('[[queues.consumers]]').slice(1);
+  const dlq = consumers.find((block) => /^queue = "jobs-dlq"$/m.test(block));
+  assert.ok(dlq, 'jobs-dlq has a consumer');
+  assert.doesNotMatch(dlq, /dead_letter_queue/, 'no DLQ of the DLQ');
+  assert.match(dlq, /max_retries = 100/);
+});
+
+test('DLQ recheck delay grows with the age of the parked slot, 15 min to 6 h', () => {
+  const now = Date.parse('2026-11-26T12:00:00Z');
+  const ago = (ms: number) => new Date(now - ms).toISOString();
+  assert.equal(dlqRecheckDelay(ago(10 * 60_000), now), DLQ_MIN_RECHECK_SECONDS);
+  assert.equal(dlqRecheckDelay(ago(4 * 3600_000), now), 2 * 3600);
+  assert.equal(dlqRecheckDelay(ago(3 * 86400_000), now), DLQ_MAX_RECHECK_SECONDS);
+  assert.equal(dlqRecheckDelay('not-a-date', now), DLQ_MAX_RECHECK_SECONDS);
+});
+
+test('DLQ consumer re-parks an unresolved job before queue retention can drop it', async () => {
+  globalThis.fetch = (async () => Response.json({ total_count: 0 })) as typeof fetch;
+  const resent: { body: unknown; options: unknown }[] = [];
+  const env = makeEnv({ JOBS_DLQ: { async send(body, options) { resent.push({ body, options }); return null; } } }).env;
+  const body = jobEnvelope(marts, 'jobs-marts:2026-11-20T00:00:00.000Z', new Date('2026-11-20T00:00:00Z'), 'jobs-cron');
+  const old = message(body, 9, new Date(Date.now() - DLQ_RESEND_AFTER_MS - 1));
+  await handleQueue({ queue: 'jobs-dlq', messages: [old.m] }, env);
+  assert.equal(old.state.acked, true, 'the old copy goes only after the new one is queued');
+  assert.equal(resent.length, 1);
+  assert.deepEqual(resent[0].body, body);
+  assert.deepEqual(resent[0].options, { contentType: 'json', delaySeconds: DLQ_MAX_RECHECK_SECONDS });
+
+  const nearing = message(body, 5, new Date(Date.now() - DLQ_RESEND_AFTER_MS + 3600_000));
+  await handleQueue({ queue: 'jobs-dlq', messages: [nearing.m] }, env);
+  assert.equal(nearing.state.acked, true, 'a 6 h recheck would land past 18 h, so re-park now');
+  assert.equal(resent.length, 2);
+
+  const fresh = message(body, 2, new Date());
+  await handleQueue({ queue: 'jobs-dlq', messages: [fresh.m] }, env);
+  assert.equal(resent.length, 2, 'a young copy is only retried');
+  assert.equal(fresh.state.retryDelay, DLQ_MAX_RECHECK_SECONDS);
+
+  const failing = makeEnv({ JOBS_DLQ: { async send() { throw new Error('queue down'); } } }).env;
+  const stuck = message(body, 9, new Date(Date.now() - DLQ_RESEND_AFTER_MS - 1));
+  await handleQueue({ queue: 'jobs-dlq', messages: [stuck.m] }, failing);
+  assert.equal(stuck.state.acked, false, 'keeps the old copy when the re-park fails');
+  assert.equal(stuck.state.retryDelay, DLQ_MIN_RECHECK_SECONDS);
 });

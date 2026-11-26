@@ -1,12 +1,15 @@
 // Job queue Worker (ADR-0008 queue plane). Schedulers only enqueue; this Worker's queue consumer
 // runs each job's target with retries, and after max_retries the message moves to jobs-dlq.
+// The jobs-dlq consumer never runs a job again: it clears a parked job once a later run of the
+// same workflow has succeeded, and keeps it (so /healthz stays 503) until then, re-parking a copy
+// before queue retention could drop it.
 
 import * as Sentry from '@sentry/cloudflare';
 import { sentryOptions } from './sentry.js';
 import { findJob, jobsDueAt, type JobDef } from './jobs.js';
 
 export interface QueueLike {
-  send(body: unknown, options?: { contentType?: 'json' }): Promise<unknown>;
+  send(body: unknown, options?: { contentType?: 'json'; delaySeconds?: number }): Promise<unknown>;
   metrics?(): Promise<{ backlogCount: number }>;
 }
 
@@ -23,6 +26,7 @@ export interface MessageLike<T> {
   readonly id: string;
   readonly body: T;
   readonly attempts: number;
+  readonly timestamp: Date;
   ack(): void;
   retry(options?: { delaySeconds?: number }): void;
 }
@@ -33,6 +37,14 @@ export interface MessageBatchLike<T> {
 }
 
 export const RETRY_DELAY_SECONDS = 60;
+// A parked job is checked again after half its age (time since its slot), from 15 min to 6 h, so a
+// wide outage that parks hundreds of jobs costs few queue operations (Workers Free: 10,000 a day).
+export const DLQ_MIN_RECHECK_SECONDS = 15 * 60;
+export const DLQ_MAX_RECHECK_SECONDS = 6 * 3600;
+// Queue retention (24 h on Workers Free) or max_retries would silently drop an unresolved job and
+// turn /healthz green; a copy whose next recheck would land past this age is sent to jobs-dlq again.
+export const DLQ_RESEND_AFTER_MS = 18 * 3600_000;
+export const DLQ_QUEUE = 'jobs-dlq';
 export const TARGET_TIMEOUT_MS = 15_000;
 const MAX_BODY_BYTES = 4 * 1024;
 
@@ -121,6 +133,15 @@ export async function handleScheduled(scheduledTime: number, env: Env): Promise<
   return jobs.length;
 }
 
+function githubHeaders(token: string): Record<string, string> {
+  return {
+    authorization: `Bearer ${token}`,
+    accept: 'application/vnd.github+json',
+    'x-github-api-version': '2022-11-28',
+    'user-agent': 'solo-empire-jobs',
+  };
+}
+
 // Returns true when the target accepted the job.
 export async function runJob(job: JobDef, message: JobEnvelope, env: Env): Promise<boolean> {
   const target = job.target;
@@ -128,13 +149,7 @@ export async function runJob(job: JobDef, message: JobEnvelope, env: Env): Promi
     if (!env.GITHUB_DISPATCH_TOKEN) return false;
     const res = await fetch(`https://api.github.com/repos/${target.repo}/actions/workflows/${target.workflow}/dispatches`, {
       method: 'POST',
-      headers: {
-        authorization: `Bearer ${env.GITHUB_DISPATCH_TOKEN}`,
-        accept: 'application/vnd.github+json',
-        'x-github-api-version': '2022-11-28',
-        'user-agent': 'solo-empire-jobs',
-        'content-type': 'application/json',
-      },
+      headers: { ...githubHeaders(env.GITHUB_DISPATCH_TOKEN), 'content-type': 'application/json' },
       body: JSON.stringify(target.inputs ? { ref: target.ref, inputs: target.inputs } : { ref: target.ref }),
       signal: AbortSignal.timeout(TARGET_TIMEOUT_MS),
     });
@@ -151,7 +166,75 @@ export async function runJob(job: JobDef, message: JobEnvelope, env: Env): Promi
   return res.ok;
 }
 
+// True when a run of the job's workflow on its ref, created at or after the parked slot, succeeded.
+// http jobs have no run history to read, so they stay parked until the message expires.
+export async function laterRunSucceeded(job: JobDef, message: JobEnvelope, env: Env): Promise<boolean> {
+  const target = job.target;
+  if (target.kind !== 'github_workflow' || !env.GITHUB_DISPATCH_TOKEN) return false;
+  const slot = new Date(message.occurred_at);
+  if (Number.isNaN(slot.getTime())) return false;
+  const url = new URL(`https://api.github.com/repos/${target.repo}/actions/workflows/${target.workflow}/runs`);
+  url.searchParams.set('status', 'success');
+  url.searchParams.set('branch', target.ref);
+  url.searchParams.set('created', `>=${slot.toISOString()}`);
+  url.searchParams.set('per_page', '1');
+  const res = await fetch(url.toString(), {
+    method: 'GET',
+    headers: githubHeaders(env.GITHUB_DISPATCH_TOKEN),
+    signal: AbortSignal.timeout(TARGET_TIMEOUT_MS),
+  });
+  if (!res.ok) return false;
+  const body = (await res.json()) as { total_count?: unknown };
+  return typeof body.total_count === 'number' && body.total_count > 0;
+}
+
+export function dlqRecheckDelay(occurredAt: string, now = Date.now()): number {
+  const slot = Date.parse(occurredAt);
+  if (Number.isNaN(slot)) return DLQ_MAX_RECHECK_SECONDS;
+  const half = Math.floor((now - slot) / 2000);
+  return Math.min(DLQ_MAX_RECHECK_SECONDS, Math.max(DLQ_MIN_RECHECK_SECONDS, half));
+}
+
+async function handleDeadLetters(batch: MessageBatchLike<JobEnvelope>, env: Env): Promise<void> {
+  for (const message of batch.messages) {
+    const name = message.body?.data?.job;
+    const job = typeof name === 'string' ? findJob(name) : undefined;
+    if (!job) {
+      console.warn('jobs-dlq: unknown job dropped', message.id);
+      message.ack();
+      continue;
+    }
+    let cleared = false;
+    try {
+      cleared = await laterRunSucceeded(job, message.body, env);
+    } catch {
+      cleared = false;
+    }
+    if (cleared) {
+      console.log('jobs-dlq: cleared, a later run succeeded', message.body.id);
+      message.ack();
+      continue;
+    }
+    const delaySeconds = dlqRecheckDelay(message.body.occurred_at);
+    // Retry only when the next delivery still lands before 18 h of this copy's age (6 h of slack
+    // to the 24 h retention); otherwise re-park a fresh copy now.
+    if (Date.now() - message.timestamp.getTime() + delaySeconds * 1000 < DLQ_RESEND_AFTER_MS) {
+      message.retry({ delaySeconds });
+      continue;
+    }
+    try {
+      if (!env.JOBS_DLQ) throw new Error('JOBS_DLQ not bound');
+      await env.JOBS_DLQ.send(message.body, { contentType: 'json', delaySeconds });
+      message.ack();
+    } catch {
+      // Keep the old copy and try the re-park again soon; it still has hours of retention.
+      message.retry({ delaySeconds: DLQ_MIN_RECHECK_SECONDS });
+    }
+  }
+}
+
 export async function handleQueue(batch: MessageBatchLike<JobEnvelope>, env: Env): Promise<void> {
+  if (batch.queue === DLQ_QUEUE) return handleDeadLetters(batch, env);
   for (const message of batch.messages) {
     const name = message.body?.data?.job;
     const job = typeof name === 'string' ? findJob(name) : undefined;

@@ -18,7 +18,7 @@ crons = ["* * * * *"]
 binding = "JOBS_QUEUE"
 queue = "jobs"
 
-# Bound only to read the DLQ backlog for /healthz.
+# Bound to read the DLQ backlog for /healthz.
 [[queues.producers]]
 binding = "JOBS_DLQ"
 queue = "jobs-dlq"
@@ -35,3 +35,15 @@ dead_letter_queue = "jobs-dlq"
 #   GITHUB_DISPATCH_TOKEN  required for github_workflow jobs (Actions: write on the target repos)
 #   GATEWAY_TOKEN          optional, bearer for http jobs routed through the API gateway
 #   SENTRY_DSN             optional, error reporting (unset = off)
+
+# Parked jobs: never run again here. Each is checked after half its age (15 min to 6 h) and acked
+# once a later run of the same workflow succeeded; until then it stays and /healthz answers 503.
+# A copy whose next recheck would land past 18 h of age is re-sent to jobs-dlq (retention 24 h on Free), so
+# a job only leaves when it is resolved. max_retries is only a backstop.
+# Before `wrangler rollback` to a version without this consumer, remove it first
+# (`wrangler queues consumer remove jobs-dlq solo-empire-jobs`) or the old code would run parked jobs.
+[[queues.consumers]]
+queue = "jobs-dlq"
+max_batch_size = 10
+max_batch_timeout = 30
+max_retries = 100
