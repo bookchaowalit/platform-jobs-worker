@@ -278,8 +278,23 @@ test('DLQ consumer drops a parked slot once a newer scheduled slot is past (it c
   globalThis.fetch = (async () => { fetched++; return Response.json({ total_count: 0 }); }) as typeof fetch;
   const slot = new Date(Date.now() - 6 * 3600_000);
   slot.setUTCMinutes(47, 0, 0);
-  const { m, state } = message(jobEnvelope(marts, `jobs-marts:${slot.toISOString()}`, slot, 'jobs-cron'), 3);
-  await handleQueue({ queue: 'jobs-dlq', messages: [m] }, makeEnv().env);
-  assert.equal(state.acked, true);
+  const body = jobEnvelope(marts, `jobs-marts:${slot.toISOString()}`, slot, 'jobs-cron');
+  const dlq = (backlogCount: number | Error) => ({
+    async send() { return null; },
+    async metrics() { if (backlogCount instanceof Error) throw backlogCount; return { backlogCount }; },
+  });
+  const { m, state } = message(body, 3);
+  await handleQueue({ queue: 'jobs-dlq', messages: [m] }, makeEnv({ JOBS_DLQ: dlq(3) }).env);
+  assert.equal(state.acked, true, 'other parked messages keep /healthz at 503');
   assert.equal(state.retryDelay, undefined);
+
+  // The last parked message is never dropped on the schedule alone: a stopped cron or a stuck
+  // `jobs` queue would otherwise turn /healthz green without any run.
+  const alone = message(body, 3);
+  await handleQueue({ queue: 'jobs-dlq', messages: [alone.m] }, makeEnv({ JOBS_DLQ: dlq(1) }).env);
+  assert.equal(alone.state.acked, false);
+  assert.ok((alone.state.retryDelay ?? 0) >= 2 * 3600, "rechecked by age as usual");
+  const unknown = message(body, 3);
+  await handleQueue({ queue: 'jobs-dlq', messages: [unknown.m] }, makeEnv({ JOBS_DLQ: dlq(new Error('metrics down')) }).env);
+  assert.equal(unknown.state.acked, false, 'no backlog reading, no drop');
 });
