@@ -37,7 +37,8 @@ dead_letter_queue = "jobs-dlq"
 #   SENTRY_DSN             optional, error reporting (unset = off)
 
 # Parked jobs: never run again here. Each is checked after half its age (15 min to 6 h) and acked
-# once a later run of the same workflow succeeded; until then it stays and /healthz answers 503.
+# once a later queue-dispatched run of the same workflow succeeded, or a newer scheduled slot of the
+# job is over 1 h old (it carries the alert); until then it stays and /healthz answers 503.
 # A copy whose next recheck would land past 18 h of age is re-sent to jobs-dlq (retention 24 h on Free), so
 # a job only leaves when it is resolved. max_retries is only a backstop.
 # Before `wrangler rollback` to a version without this consumer, remove it first

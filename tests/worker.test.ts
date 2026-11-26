@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { afterEach, test } from 'node:test';
 import { parseCron } from '../src/cron.js';
 import { JOBS } from '../src/jobs.js';
-import { DLQ_MAX_RECHECK_SECONDS, DLQ_MIN_RECHECK_SECONDS, DLQ_RESEND_AFTER_MS, dlqRecheckDelay, handleQueue, handleRequest, handleScheduled, jobEnvelope, type Env, type JobEnvelope, type MessageLike } from '../src/worker.js';
+import { DLQ_LATER_SLOT_GRACE_MS, DLQ_MAX_RECHECK_SECONDS, hasLaterSlot, DLQ_MIN_RECHECK_SECONDS, DLQ_RESEND_AFTER_MS, dlqRecheckDelay, handleQueue, handleRequest, handleScheduled, jobEnvelope, type Env, type JobEnvelope, type MessageLike } from '../src/worker.js';
 
 // Test-only fixtures; not real credentials.
 const jobsCredential = ['fixture', 'jobs', 'value'].join('-');
@@ -163,6 +163,7 @@ test('DLQ consumer acks a parked job once a later run of the same workflow succe
   assert.equal(url.pathname, '/repos/bookchaowalit/data-lake-pipelines/actions/workflows/jobs-marts.yml/runs');
   assert.equal(url.searchParams.get('status'), 'success');
   assert.equal(url.searchParams.get('branch'), 'main');
+  assert.equal(url.searchParams.get('event'), 'workflow_dispatch', 'a GitHub schedule run is no proof the queue dispatch works');
   assert.equal(url.searchParams.get('created'), '>=2026-11-25T15:45:00.000Z');
   assert.equal(calls[0].init.method ?? 'GET', 'GET');
   assert.equal((calls[0].init.headers as Record<string, string>).authorization, `Bearer ${dispatchCredential}`);
@@ -232,27 +233,53 @@ test('DLQ consumer re-parks an unresolved job before queue retention can drop it
   globalThis.fetch = (async () => Response.json({ total_count: 0 })) as typeof fetch;
   const resent: { body: unknown; options: unknown }[] = [];
   const env = makeEnv({ JOBS_DLQ: { async send(body, options) { resent.push({ body, options }); return null; } } }).env;
-  const body = jobEnvelope(marts, 'jobs-marts:2026-11-20T00:00:00.000Z', new Date('2026-11-20T00:00:00Z'), 'jobs-cron');
+  // A slot 30 min old has no newer scheduled slot past the grace period, so only age matters.
+  const recent = new Date(Date.now() - 30 * 60_000);
+  const body = jobEnvelope(marts, `jobs-marts:${recent.toISOString()}`, recent, 'jobs-cron');
   const old = message(body, 9, new Date(Date.now() - DLQ_RESEND_AFTER_MS - 1));
   await handleQueue({ queue: 'jobs-dlq', messages: [old.m] }, env);
   assert.equal(old.state.acked, true, 'the old copy goes only after the new one is queued');
   assert.equal(resent.length, 1);
   assert.deepEqual(resent[0].body, body);
-  assert.deepEqual(resent[0].options, { contentType: 'json', delaySeconds: DLQ_MAX_RECHECK_SECONDS });
+  assert.deepEqual(resent[0].options, { contentType: 'json', delaySeconds: DLQ_MIN_RECHECK_SECONDS });
 
-  const nearing = message(body, 5, new Date(Date.now() - DLQ_RESEND_AFTER_MS + 3600_000));
+  const nearing = message(body, 5, new Date(Date.now() - DLQ_RESEND_AFTER_MS + 5 * 60_000));
   await handleQueue({ queue: 'jobs-dlq', messages: [nearing.m] }, env);
-  assert.equal(nearing.state.acked, true, 'a 6 h recheck would land past 18 h, so re-park now');
+  assert.equal(nearing.state.acked, true, 'the next recheck would land past 18 h, so re-park now');
   assert.equal(resent.length, 2);
 
   const fresh = message(body, 2, new Date());
   await handleQueue({ queue: 'jobs-dlq', messages: [fresh.m] }, env);
   assert.equal(resent.length, 2, 'a young copy is only retried');
-  assert.equal(fresh.state.retryDelay, DLQ_MAX_RECHECK_SECONDS);
+  assert.equal(fresh.state.retryDelay, DLQ_MIN_RECHECK_SECONDS);
 
   const failing = makeEnv({ JOBS_DLQ: { async send() { throw new Error('queue down'); } } }).env;
   const stuck = message(body, 9, new Date(Date.now() - DLQ_RESEND_AFTER_MS - 1));
   await handleQueue({ queue: 'jobs-dlq', messages: [stuck.m] }, failing);
   assert.equal(stuck.state.acked, false, 'keeps the old copy when the re-park fails');
   assert.equal(stuck.state.retryDelay, DLQ_MIN_RECHECK_SECONDS);
+});
+
+test('hasLaterSlot finds a newer scheduled slot that is past the grace period', () => {
+  const now = Date.parse('2026-11-26T12:00:00Z');
+  // jobs-marts runs at :47 every 2 h.
+  assert.equal(hasLaterSlot(marts, new Date('2026-11-26T08:47:00Z'), now), true, '10:47 is past and over 1 h old');
+  assert.equal(hasLaterSlot(marts, new Date('2026-11-26T10:47:00Z'), now), false, 'no later slot yet');
+  assert.equal(hasLaterSlot(marts, new Date('2026-11-26T08:47:00Z'), Date.parse('2026-11-26T11:00:00Z')), false, '10:47 is still inside the grace period');
+  const weekly = JOBS.find((j) => j.name === 'polyglot-bench')!;
+  assert.equal(hasLaterSlot(weekly, new Date('2026-11-23T02:00:00Z'), now), false, 'next weekly slot is days away');
+  assert.equal(hasLaterSlot(weekly, new Date('2026-11-02T02:00:00Z'), now), true, 'an older weekly slot has a newer one');
+  assert.equal(hasLaterSlot({ name: 'manual-only', target: marts.target }, new Date('2026-11-01T00:00:00Z'), now), false, 'no cron, no later slot');
+  assert.ok(DLQ_LATER_SLOT_GRACE_MS >= 3600_000);
+});
+
+test('DLQ consumer drops a parked slot once a newer scheduled slot is past (it carries the alert)', async () => {
+  let fetched = 0;
+  globalThis.fetch = (async () => { fetched++; return Response.json({ total_count: 0 }); }) as typeof fetch;
+  const slot = new Date(Date.now() - 6 * 3600_000);
+  slot.setUTCMinutes(47, 0, 0);
+  const { m, state } = message(jobEnvelope(marts, `jobs-marts:${slot.toISOString()}`, slot, 'jobs-cron'), 3);
+  await handleQueue({ queue: 'jobs-dlq', messages: [m] }, makeEnv().env);
+  assert.equal(state.acked, true);
+  assert.equal(state.retryDelay, undefined);
 });
