@@ -36,10 +36,12 @@ dead_letter_queue = "jobs-dlq"
 #   GATEWAY_TOKEN          optional, bearer for http jobs routed through the API gateway
 #   SENTRY_DSN             optional, error reporting (unset = off)
 
-# Parked jobs: never run again here. Each is checked every 15 min (DLQ_RECHECK_SECONDS) and acked
+# Parked jobs: never run again here. Each is checked after half its age (15 min to 6 h) and acked
 # once a later run of the same workflow succeeded; until then it stays and /healthz answers 503.
-# It has no DLQ of its own: a job still unresolved after 100 checks (~25 h) is dropped, and the
-# queue's message retention may drop it earlier. The uptime alert has fired by then.
+# A copy older than 18 h is sent to jobs-dlq again before retention (24 h on Free) can drop it, so
+# a job only leaves when it is resolved. max_retries is only a backstop.
+# Before `wrangler rollback` to a version without this consumer, remove it first
+# (`wrangler queues consumer remove jobs-dlq solo-empire-jobs`) or the old code would run parked jobs.
 [[queues.consumers]]
 queue = "jobs-dlq"
 max_batch_size = 10

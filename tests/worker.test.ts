@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { afterEach, test } from 'node:test';
 import { parseCron } from '../src/cron.js';
 import { JOBS } from '../src/jobs.js';
-import { DLQ_RECHECK_SECONDS, handleQueue, handleRequest, handleScheduled, jobEnvelope, type Env, type JobEnvelope, type MessageLike } from '../src/worker.js';
+import { DLQ_MAX_RECHECK_SECONDS, DLQ_MIN_RECHECK_SECONDS, DLQ_RESEND_AFTER_MS, dlqRecheckDelay, handleQueue, handleRequest, handleScheduled, jobEnvelope, type Env, type JobEnvelope, type MessageLike } from '../src/worker.js';
 
 // Test-only fixtures; not real credentials.
 const jobsCredential = ['fixture', 'jobs', 'value'].join('-');
@@ -30,10 +30,10 @@ function enqueue(body: unknown, credential = jobsCredential) {
   });
 }
 
-function message(body: JobEnvelope, attempts = 1) {
+function message(body: JobEnvelope, attempts = 1, timestamp = new Date()) {
   const state = { acked: false, retryDelay: undefined as number | undefined };
   const m: MessageLike<JobEnvelope> = {
-    id: 'm1', body, attempts,
+    id: 'm1', body, attempts, timestamp,
     ack() { state.acked = true; },
     retry(options) { state.retryDelay = options?.delaySeconds ?? 0; },
   };
@@ -174,13 +174,13 @@ test('DLQ consumer keeps a parked job (delayed recheck) until a later run succee
   const none = message(jobEnvelope(marts, 'e', new Date(), 'jobs-cron'), 4);
   await handleQueue({ queue: 'jobs-dlq', messages: [none.m] }, makeEnv().env);
   assert.equal(none.state.acked, false);
-  assert.equal(none.state.retryDelay, DLQ_RECHECK_SECONDS);
+  assert.equal(none.state.retryDelay, DLQ_MIN_RECHECK_SECONDS);
 
   globalThis.fetch = (async () => new Response('forbidden', { status: 403 })) as typeof fetch;
   const denied = message(jobEnvelope(marts, 'f', new Date(), 'jobs-cron'));
   await handleQueue({ queue: 'jobs-dlq', messages: [denied.m] }, makeEnv().env);
   assert.equal(denied.state.acked, false);
-  assert.equal(denied.state.retryDelay, DLQ_RECHECK_SECONDS);
+  assert.equal(denied.state.retryDelay, DLQ_MIN_RECHECK_SECONDS);
 
   globalThis.fetch = (async () => { throw new Error('offline'); }) as typeof fetch;
   const offline = message(jobEnvelope(marts, 'g', new Date(), 'jobs-cron'));
@@ -217,4 +217,37 @@ test('wrangler.toml consumes jobs-dlq with the recheck consumer', () => {
   assert.ok(dlq, 'jobs-dlq has a consumer');
   assert.doesNotMatch(dlq, /dead_letter_queue/, 'no DLQ of the DLQ');
   assert.match(dlq, /max_retries = 100/);
+});
+
+test('DLQ recheck delay grows with the age of the parked slot, 15 min to 6 h', () => {
+  const now = Date.parse('2026-11-26T12:00:00Z');
+  const ago = (ms: number) => new Date(now - ms).toISOString();
+  assert.equal(dlqRecheckDelay(ago(10 * 60_000), now), DLQ_MIN_RECHECK_SECONDS);
+  assert.equal(dlqRecheckDelay(ago(4 * 3600_000), now), 2 * 3600);
+  assert.equal(dlqRecheckDelay(ago(3 * 86400_000), now), DLQ_MAX_RECHECK_SECONDS);
+  assert.equal(dlqRecheckDelay('not-a-date', now), DLQ_MAX_RECHECK_SECONDS);
+});
+
+test('DLQ consumer re-parks an unresolved job before queue retention can drop it', async () => {
+  globalThis.fetch = (async () => Response.json({ total_count: 0 })) as typeof fetch;
+  const resent: { body: unknown; options: unknown }[] = [];
+  const env = makeEnv({ JOBS_DLQ: { async send(body, options) { resent.push({ body, options }); return null; } } }).env;
+  const body = jobEnvelope(marts, 'jobs-marts:2026-11-20T00:00:00.000Z', new Date('2026-11-20T00:00:00Z'), 'jobs-cron');
+  const old = message(body, 9, new Date(Date.now() - DLQ_RESEND_AFTER_MS - 1));
+  await handleQueue({ queue: 'jobs-dlq', messages: [old.m] }, env);
+  assert.equal(old.state.acked, true, 'the old copy goes only after the new one is queued');
+  assert.equal(resent.length, 1);
+  assert.deepEqual(resent[0].body, body);
+  assert.deepEqual(resent[0].options, { contentType: 'json', delaySeconds: DLQ_MAX_RECHECK_SECONDS });
+
+  const fresh = message(body, 2, new Date());
+  await handleQueue({ queue: 'jobs-dlq', messages: [fresh.m] }, env);
+  assert.equal(resent.length, 1, 'a young copy is only retried');
+  assert.equal(fresh.state.retryDelay, DLQ_MAX_RECHECK_SECONDS);
+
+  const failing = makeEnv({ JOBS_DLQ: { async send() { throw new Error('queue down'); } } }).env;
+  const stuck = message(body, 9, new Date(Date.now() - DLQ_RESEND_AFTER_MS - 1));
+  await handleQueue({ queue: 'jobs-dlq', messages: [stuck.m] }, failing);
+  assert.equal(stuck.state.acked, false, 'keeps the old copy when the re-park fails');
+  assert.equal(stuck.state.retryDelay, DLQ_MIN_RECHECK_SECONDS);
 });

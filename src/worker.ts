@@ -1,14 +1,15 @@
 // Job queue Worker (ADR-0008 queue plane). Schedulers only enqueue; this Worker's queue consumer
 // runs each job's target with retries, and after max_retries the message moves to jobs-dlq.
 // The jobs-dlq consumer never runs a job again: it clears a parked job once a later run of the
-// same workflow has succeeded, and keeps it (so /healthz stays 503) until then.
+// same workflow has succeeded, and keeps it (so /healthz stays 503) until then, re-parking a copy
+// before queue retention could drop it.
 
 import * as Sentry from '@sentry/cloudflare';
 import { sentryOptions } from './sentry.js';
 import { findJob, jobsDueAt, type JobDef } from './jobs.js';
 
 export interface QueueLike {
-  send(body: unknown, options?: { contentType?: 'json' }): Promise<unknown>;
+  send(body: unknown, options?: { contentType?: 'json'; delaySeconds?: number }): Promise<unknown>;
   metrics?(): Promise<{ backlogCount: number }>;
 }
 
@@ -25,6 +26,7 @@ export interface MessageLike<T> {
   readonly id: string;
   readonly body: T;
   readonly attempts: number;
+  readonly timestamp: Date;
   ack(): void;
   retry(options?: { delaySeconds?: number }): void;
 }
@@ -35,8 +37,13 @@ export interface MessageBatchLike<T> {
 }
 
 export const RETRY_DELAY_SECONDS = 60;
-// How often a parked job is checked again for a later successful run.
-export const DLQ_RECHECK_SECONDS = 15 * 60;
+// A parked job is checked again after half its age (time since its slot), from 15 min to 6 h, so a
+// wide outage that parks hundreds of jobs costs few queue operations (Workers Free: 10,000 a day).
+export const DLQ_MIN_RECHECK_SECONDS = 15 * 60;
+export const DLQ_MAX_RECHECK_SECONDS = 6 * 3600;
+// Queue retention (24 h on Workers Free) or max_retries would silently drop an unresolved job and
+// turn /healthz green; a copy older than this is sent to jobs-dlq again first.
+export const DLQ_RESEND_AFTER_MS = 18 * 3600_000;
 export const DLQ_QUEUE = 'jobs-dlq';
 export const TARGET_TIMEOUT_MS = 15_000;
 const MAX_BODY_BYTES = 4 * 1024;
@@ -181,6 +188,13 @@ export async function laterRunSucceeded(job: JobDef, message: JobEnvelope, env: 
   return typeof body.total_count === 'number' && body.total_count > 0;
 }
 
+export function dlqRecheckDelay(occurredAt: string, now = Date.now()): number {
+  const slot = Date.parse(occurredAt);
+  if (Number.isNaN(slot)) return DLQ_MAX_RECHECK_SECONDS;
+  const half = Math.floor((now - slot) / 2000);
+  return Math.min(DLQ_MAX_RECHECK_SECONDS, Math.max(DLQ_MIN_RECHECK_SECONDS, half));
+}
+
 async function handleDeadLetters(batch: MessageBatchLike<JobEnvelope>, env: Env): Promise<void> {
   for (const message of batch.messages) {
     const name = message.body?.data?.job;
@@ -199,8 +213,20 @@ async function handleDeadLetters(batch: MessageBatchLike<JobEnvelope>, env: Env)
     if (cleared) {
       console.log('jobs-dlq: cleared, a later run succeeded', message.body.id);
       message.ack();
-    } else {
-      message.retry({ delaySeconds: DLQ_RECHECK_SECONDS });
+      continue;
+    }
+    const delaySeconds = dlqRecheckDelay(message.body.occurred_at);
+    if (Date.now() - message.timestamp.getTime() < DLQ_RESEND_AFTER_MS) {
+      message.retry({ delaySeconds });
+      continue;
+    }
+    try {
+      if (!env.JOBS_DLQ) throw new Error('JOBS_DLQ not bound');
+      await env.JOBS_DLQ.send(message.body, { contentType: 'json', delaySeconds });
+      message.ack();
+    } catch {
+      // Keep the old copy and try the re-park again soon; it still has hours of retention.
+      message.retry({ delaySeconds: DLQ_MIN_RECHECK_SECONDS });
     }
   }
 }

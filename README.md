@@ -20,7 +20,7 @@ POST /enqueue ───┴─► queue `jobs` ─► consumer (retry) ──┤
 | `scheduled` | One every-minute trigger (Workers Free allows 5 cron triggers per account). Each minute, `src/cron.ts` matches every job's own UTC cron and enqueues the due jobs. Message id = `<job>:<slot ISO time>`. |
 | `POST /enqueue` | Bearer `JOBS_TOKEN`; body `{"job":"<name>"}`. Only jobs in the registry are accepted (`404 unknown_job`), so it can never call an arbitrary URL. `202 {"queued":true,"id":...}`. |
 | `queue` (`jobs`) | Runs the job target. `github_workflow`: `POST /repos/{repo}/actions/workflows/{wf}/dispatches` with the job's `inputs`, ack on `204`. `http`: POST the envelope with a bearer and `idempotency-key`, ack on 2xx. Otherwise retry after 60 s × attempt; after 5 retries → `jobs-dlq`. |
-| `queue` (`jobs-dlq`) | Never runs a job again. On arrival and every 15 min after, it reads the workflow's runs (`status=success`, the job's `ref`, `created>=` the parked slot) and acks the message once one exists, so the alert clears by itself. Until then it stays parked (retry, delay 15 min, up to 100 checks, no DLQ of its own; queue retention may drop it earlier). An `http` job has no run history and stays until it expires; a job no longer in the registry is dropped. |
+| `queue` (`jobs-dlq`) | Never runs a job again. On arrival, then after half the parked slot's age (15 min to 6 h), it reads the workflow's runs (`status=success`, the job's `ref`, `created>=` the slot) and acks the message once one exists, so the alert clears by itself. Until then it stays parked; a copy older than 18 h is sent to `jobs-dlq` again before queue retention (24 h on Workers Free) can drop it, so `/healthz` never turns green on an unresolved job. An `http` job has no run history and stays until purged; a job no longer in the registry is dropped. |
 | `GET /healthz` | `200 {"ok":true,"dlq_backlog":0}`; `503` while `jobs-dlq` holds messages, which the uptime Worker (`jobs-worker` target) turns into a Telegram alert. |
 
 Message body = ADR-0008 envelope: `{id,type:"job.<name>.requested",version,occurred_at,producer,correlation_id,causation_id,data:{job}}`.
@@ -78,4 +78,6 @@ completed `success`; unknown job `404`, no bearer `401`; `/healthz` `200` with `
 `GITHUB_DISPATCH_TOKEN` is the existing all-repo fine-grained token (`REGISTRY_EXPORT_GITHUB_TOKEN`).
 Owner item: replace it with a fine-grained token limited to **Actions: write** on the job repos.
 
-Rollback: `npx wrangler rollback`, then restore the `schedule:` blocks named in the table.
+Rollback: to a version older than the `jobs-dlq` consumer, first `npx wrangler queues consumer remove jobs-dlq solo-empire-jobs` (keeps the queue and its messages; the old code would otherwise run parked jobs again), then `npx wrangler rollback`, then restore the `schedule:` blocks named in the table.
+
+Known gap: a wide outage that parks every scheduled job (~540 a day) can still exhaust the Workers Free Queues quota (10,000 operations a day, shared with `jobs`): the `jobs` retries alone cost about as much. The DLQ rechecks back off to 6 h to keep their share small.
