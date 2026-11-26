@@ -77,6 +77,16 @@ export function findJob(name: string): JobDef | undefined {
   return JOBS.find((job) => job.name === name);
 }
 
+// The cron's minute values (empty without a cron), so callers can skip whole hours cheaply.
+export function jobMinutes(job: JobDef): ReadonlySet<number> {
+  return PARSED.get(job.name)?.fields[0] ?? new Set<number>();
+}
+
+export function jobDueAt(job: JobDef, at: Date): boolean {
+  const cron = PARSED.get(job.name);
+  return cron ? cronMatches(cron, at) : false;
+}
+
 export function jobsDueAt(at: Date): JobDef[] {
   return JOBS.filter((job) => {
     const cron = PARSED.get(job.name);

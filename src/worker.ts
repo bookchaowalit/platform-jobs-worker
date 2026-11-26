@@ -6,7 +6,7 @@
 
 import * as Sentry from '@sentry/cloudflare';
 import { sentryOptions } from './sentry.js';
-import { findJob, jobsDueAt, type JobDef } from './jobs.js';
+import { findJob, jobDueAt, jobMinutes, jobsDueAt, type JobDef } from './jobs.js';
 
 export interface QueueLike {
   send(body: unknown, options?: { contentType?: 'json'; delaySeconds?: number }): Promise<unknown>;
@@ -176,6 +176,9 @@ export async function laterRunSucceeded(job: JobDef, message: JobEnvelope, env: 
   const url = new URL(`https://api.github.com/repos/${target.repo}/actions/workflows/${target.workflow}/runs`);
   url.searchParams.set('status', 'success');
   url.searchParams.set('branch', target.ref);
+  // Only queue-style dispatches prove the Worker's dispatch path works (a workflow may also keep
+  // its own GitHub schedule, as monitor-watchdog does).
+  url.searchParams.set('event', 'workflow_dispatch');
   url.searchParams.set('created', `>=${slot.toISOString()}`);
   url.searchParams.set('per_page', '1');
   const res = await fetch(url.toString(), {
@@ -186,6 +189,24 @@ export async function laterRunSucceeded(job: JobDef, message: JobEnvelope, env: 
   if (!res.ok) return false;
   const body = (await res.json()) as { total_count?: unknown };
   return typeof body.total_count === 'number' && body.total_count > 0;
+}
+
+// A newer scheduled slot this old has either been dispatched (the queue dispatch works again) or
+// is parked itself and carries the alert, so the older parked slot is redundant.
+export const DLQ_LATER_SLOT_GRACE_MS = 3600_000;
+// Bounds the minute scan; a weekly job always has a newer slot within 8 days.
+const LATER_SLOT_SCAN_MS = 8 * 86400_000;
+
+export function hasLaterSlot(job: JobDef, slot: Date, now = Date.now()): boolean {
+  const until = Math.min(now - DLQ_LATER_SLOT_GRACE_MS, slot.getTime() + LATER_SLOT_SCAN_MS);
+  const first = Math.floor(slot.getTime() / 60_000) * 60_000 + 60_000;
+  const minutes = jobMinutes(job);
+  if (minutes.size === 0) return false;
+  for (let t = first; t <= until; t += 60_000) {
+    // Only build a Date on minutes the cron can match (Workers Free: 10 ms CPU per invocation).
+    if (minutes.has((t / 60_000) % 60) && jobDueAt(job, new Date(t))) return true;
+  }
+  return false;
 }
 
 export function dlqRecheckDelay(occurredAt: string, now = Date.now()): number {
@@ -212,6 +233,12 @@ async function handleDeadLetters(batch: MessageBatchLike<JobEnvelope>, env: Env)
     }
     if (cleared) {
       console.log('jobs-dlq: cleared, a later run succeeded', message.body.id);
+      message.ack();
+      continue;
+    }
+    const slot = new Date(message.body.occurred_at);
+    if (!Number.isNaN(slot.getTime()) && hasLaterSlot(job, slot)) {
+      console.log('jobs-dlq: superseded by a newer slot', message.body.id);
       message.ack();
       continue;
     }
