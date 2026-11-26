@@ -192,7 +192,8 @@ export async function laterRunSucceeded(job: JobDef, message: JobEnvelope, env: 
 }
 
 // A newer scheduled slot this old has either been dispatched (the queue dispatch works again) or
-// is parked itself and carries the alert, so the older parked slot is redundant.
+// is parked itself and carries the alert, so the older parked slot is redundant, but it is only
+// dropped while other messages stay parked (otherParked).
 export const DLQ_LATER_SLOT_GRACE_MS = 3600_000;
 // Bounds the minute scan; a weekly job always has a newer slot within 8 days.
 const LATER_SLOT_SCAN_MS = 8 * 86400_000;
@@ -216,6 +217,17 @@ export function dlqRecheckDelay(occurredAt: string, now = Date.now()): number {
   return Math.min(DLQ_MAX_RECHECK_SECONDS, Math.max(DLQ_MIN_RECHECK_SECONDS, half));
 }
 
+// True when jobs-dlq holds messages besides this one, so dropping it cannot turn /healthz green.
+// A later slot on the schedule is no proof by itself: the cron or the `jobs` queue may be stuck.
+async function otherParked(env: Env): Promise<boolean> {
+  try {
+    const metrics = env.JOBS_DLQ?.metrics ? await env.JOBS_DLQ.metrics() : null;
+    return metrics !== null && metrics.backlogCount > 1;
+  } catch {
+    return false;
+  }
+}
+
 async function handleDeadLetters(batch: MessageBatchLike<JobEnvelope>, env: Env): Promise<void> {
   for (const message of batch.messages) {
     const name = message.body?.data?.job;
@@ -237,7 +249,7 @@ async function handleDeadLetters(batch: MessageBatchLike<JobEnvelope>, env: Env)
       continue;
     }
     const slot = new Date(message.body.occurred_at);
-    if (!Number.isNaN(slot.getTime()) && hasLaterSlot(job, slot)) {
+    if (!Number.isNaN(slot.getTime()) && hasLaterSlot(job, slot) && (await otherParked(env))) {
       console.log('jobs-dlq: superseded by a newer slot', message.body.id);
       message.ack();
       continue;
