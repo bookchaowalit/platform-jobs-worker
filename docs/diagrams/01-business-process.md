@@ -9,8 +9,8 @@ Last reviewed: 2026-11-27 · commit `6a72fee`
 ```mermaid
 flowchart TD
   CRON["Cloudflare cron every minute"] --> SCHED["handleScheduled: match each job cron in UTC"]
-  ENQ["POST /enqueue with bearer JOBS_TOKEN"] --> AUTH{"token ok and job in registry?"}
-  AUTH -->|"401, 404 unknown_job, 413"| REJ["reject, nothing queued"]
+  ENQ["POST /enqueue with bearer JOBS_TOKEN"] --> AUTH{"JOBS_TOKEN set, token ok, body within limit and JSON object, job in registry?"}
+  AUTH -->|"503 not_configured, 401, 413, 400 invalid_payload, 404 unknown_job"| REJ["reject, nothing queued"]
   AUTH -->|yes| Q
   SCHED -->|"id job:slot"| Q["queue jobs"]
   Q --> CONS["consumer: findJob in src/jobs.ts"]
@@ -20,14 +20,15 @@ flowchart TD
   RUN -->|"not 204, no token, error"| RETRY["retry after 60 s x attempt, up to 5 retries"]
   RETRY --> Q
   RETRY -->|"after 5 retries"| DLQ["queue jobs-dlq"]
+  DLQ -->|"job removed from registry"| DROP2["warn, ack, drop"]
   DLQ --> CHK{"later workflow_dispatch run succeeded since the slot?"}
   CHK -->|yes| CLEAR["ack: parked job cleared"]
   CHK -->|no| NEWER{"newer slot of the job older than 1 h, and other parked messages exist?"}
   NEWER -->|yes| CLEAR
   NEWER -->|no| WAIT["retry later 15 min to 6 h; resend to jobs-dlq before 18 h age"]
   WAIT --> DLQ
-  DLQ --> HEALTH["GET /healthz: 503 while jobs-dlq has messages"]
-  HEALTH --> UPT["uptime Worker target jobs-worker, Telegram alert [ต้องยืนยัน: อยู่นอก repo นี้]"]
+  DLQ --> HEALTH["GET /healthz: 503 while jobs-dlq has messages; 200 with dlq_backlog null when the backlog cannot be read"]
+  HEALTH --> UPT["uptime Worker target jobs-worker, Telegram alert, likely after consecutive failed checks [ต้องยืนยัน: อยู่นอก repo นี้]"]
 ```
 
 Sources: `src/worker.ts` (`handleScheduled`, `handleRequest`, `handleEnqueue`, `handleQueue`, `runJob`, `handleDeadLetters`, `laterRunSucceeded`, `hasLaterSlot`, `dlqRecheckDelay`, `handleHealth`), `src/jobs.ts` (`JOBS`), `src/cron.ts`, `wrangler.toml`, `README.md`
@@ -36,7 +37,7 @@ Sources: `src/worker.ts` (`handleScheduled`, `handleRequest`, `handleEnqueue`, `
 
 - registry ใน `src/jobs.ts` มี 31 งาน ทุกงานเป็น `github_workflow` บน ref `main`; ชนิด `http` (ผ่าน gateway ด้วย `GATEWAY_TOKEN`) มีในโค้ดแต่ยังไม่มีงานใดใช้
 - งานที่มี `source: jobs-queue` ส่งเป็น input ให้ workflow แยกพฤติกรรมจาก schedule; workflow ที่ย้ายมา ต้องถอด `schedule:` ของตัวเองออก (กติกาใน `README.md`)
-- DLQ ไม่รันงานซ้ำเลย: ตรวจจาก run history ของ workflow เท่านั้น; งานชนิด `http` ไม่มี run history จึงค้างจนหมดอายุ
+- DLQ ไม่รันงานซ้ำเลย: ตรวจจาก run history ของ workflow เท่านั้น; งานชนิด `http` ถ้ามีในอนาคตจะไม่มี run history จึงไม่ถูกเคลียร์ด้วยหลักฐานการรัน และ consumer จะ re-park สำเนาใหม่ก่อนครบอายุ งานจึงค้างต่อเนื่องจนกว่าจะถูก purge, ถูกแทนที่ด้วย slot ใหม่ตามเงื่อนไข หรือถูกถอดจาก registry
 - ตาราง "State" ใน `README.md` (ปรับล่าสุด 2026-11-03/17) ไม่ครบเท่า registry: ไม่มี wiki-pageviews, open-feeds, finance-relay-*, security-signals (ดู G2)
 
 ## To-Be (ไม่มี)
